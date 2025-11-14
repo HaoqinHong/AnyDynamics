@@ -146,7 +146,7 @@ da3 auto assets/examples/SOH \
 
 ```
 
-The model architecture is defined in [`DepthAnything3Net`](src/depth_anything_3/model/da3.py), and specified with a Yaml config file located at [`src/depth_anything_3/configs`](src/depth_anything_3/configs). The input and output processing are handeled by [`DepthAnything3`](src/depth_anything_3/api.py). To customize the model architecutre, simply create a new config file (*e.g.*, `path/to/new/config`) as:
+The model architecture is defined in [`DepthAnything3Net`](src/depth_anything_3/model/da3.py), and specified with a Yaml config file located at [`src/depth_anything_3/configs`](src/depth_anything_3/configs). The input and output processing are handled by [`DepthAnything3`](src/depth_anything_3/api.py). To customize the model architecture, simply create a new config file (*e.g.*, `path/to/new/config`) as:
 
 ```yaml
 __object__:
