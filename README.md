@@ -3,7 +3,7 @@
 <!-- <h2 style="border-top: none; margin-top: 3px;">Recovering the Visual Space from Any Views</h2> -->
 
 
-[**Haotong Lin**](https://haotongl.github.io/)<sup>\*</sup> · [**Sili Chen**](https://github.com/SiliChen321)<sup>\*</sup> · [**Junhao Liew**](https://liewjunhao.github.io/)<sup>\*</sup> · [**Donny Y. Chen**](https://donydchen.github.io)<sup>\*</sup> · [**Zhenyu Li**](https://zhyever.github.io/) · [**Guang Shi**](https://scholar.google.com/citations?user=MjXxWbUAAAAJ&hl=en) · [**Jiashi Feng**](https://scholar.google.com.sg/citations?user=Q8iay0gAAAAJ&hl=en)
+[**Haotong Lin**](https://haotongl.github.io/)<sup>\*</sup> · [**Sili Chen**](https://github.com/SiliChen321)<sup>\*</sup> · [**Jun Hao Liew**](https://liewjunhao.github.io/)<sup>\*</sup> · [**Donny Y. Chen**](https://donydchen.github.io)<sup>\*</sup> · [**Zhenyu Li**](https://zhyever.github.io/) · [**Guang Shi**](https://scholar.google.com/citations?user=MjXxWbUAAAAJ&hl=en) · [**Jiashi Feng**](https://scholar.google.com.sg/citations?user=Q8iay0gAAAAJ&hl=en)
 <br>
 [**Bingyi Kang**](https://bingykang.github.io/)<sup>\*&dagger;</sup>
 
