@@ -3,11 +3,11 @@
 <!-- <h2 style="border-top: none; margin-top: 3px;">Recovering the Visual Space from Any Views</h2> -->
 
 
-[**Haotong Lin**](https://haotongl.github.io/)<sup>\*</sup> · [**Sili Chen**](https://github.com/SiliChen321)<sup>\*</sup> · [**Jun Hao Liew**](https://liewjunhao.github.io/)<sup>\*</sup> · [**Donny Y. Chen**](https://donydchen.github.io)<sup>\*</sup> · [**Zhenyu Li**](https://zhyever.github.io/) · [**Guang Shi**](https://scholar.google.com/citations?user=MjXxWbUAAAAJ&hl=en) · [**Jiashi Feng**](https://scholar.google.com.sg/citations?user=Q8iay0gAAAAJ&hl=en)
+[**Haotong Lin**](https://haotongl.github.io/)<sup>&ast;</sup> · [**Sili Chen**](https://github.com/SiliChen321)<sup>&ast;</sup> · [**Jun Hao Liew**](https://liewjunhao.github.io/)<sup>&ast;</sup> · [**Donny Y. Chen**](https://donydchen.github.io)<sup>&ast;</sup> · [**Zhenyu Li**](https://zhyever.github.io/) · [**Guang Shi**](https://scholar.google.com/citations?user=MjXxWbUAAAAJ&hl=en) · [**Jiashi Feng**](https://scholar.google.com.sg/citations?user=Q8iay0gAAAAJ&hl=en)
 <br>
-[**Bingyi Kang**](https://bingykang.github.io/)<sup>\*&dagger;</sup>
+[**Bingyi Kang**](https://bingykang.github.io/)<sup>&ast;&dagger;</sup>
 
-&dagger;project lead&emsp;*Equal Contribution
+&dagger;project lead&emsp;&ast;Equal Contribution
 
 <a href="https://arxiv.org/abs/2511.10647"><img src='https://img.shields.io/badge/arXiv-Depth Anything 3-red' alt='Paper PDF'></a>
 <a href='https://depth-anything-3.github.io'><img src='https://img.shields.io/badge/Project_Page-Depth Anything 3-green' alt='Project Page'></a>
