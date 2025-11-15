@@ -79,6 +79,7 @@ We introduce a new benchmark to rigorously evaluate geometry prediction models o
 ### 📦 Installation
 
 ```bash
+pip install torch\>=2 torchvision
 pip install -e . # Basic
 pip install -e ".[gs]" # Gaussians Estimation and Rendering
 pip install -e ".[app]" # Gradio, python>=3.10
