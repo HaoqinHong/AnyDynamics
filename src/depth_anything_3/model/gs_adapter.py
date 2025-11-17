@@ -86,7 +86,7 @@ class GaussianAdapter(nn.Module):
         else:
             gs_depths = depths
         # 1.2) align predicted poses with GT if needed
-        if gt_extrinsics is not None and extrinsics != gt_extrinsics:
+        if gt_extrinsics is not None and not torch.equal(extrinsics, gt_extrinsics):
             try:
                 _, _, pose_scales = batch_align_poses_umeyama(
                     gt_extrinsics.detach().float(),
