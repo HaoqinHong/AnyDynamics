@@ -1,0 +1,2 @@
+medical_test/dataset/*.npz filter=lfs diff=lfs merge=lfs -text
+medical_test/*.ply filter=lfs diff=lfs merge=lfs -text
