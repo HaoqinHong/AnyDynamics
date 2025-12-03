@@ -72,13 +72,13 @@ _final_mask.png
 
 
 ### 问题分析与改进
-为什么 Eeasi3R 的标准 Cross-Attention 和 VGGT4D 的 Gram Attention 会有一层 红色的轮廓？
-这其实是 Patch-based 模型（如 ViT/DINO）的固有特性 加上 插值算法 共同导致的：边缘响应强（Edge Attention）：DINOv2 的特征提取器非常擅长捕捉物体的 边界。对于动态物体，其边缘（与背景接触的地方）通常是语义和几何冲突最剧烈的地方，因此特征值的响应最高（红色）。而物体内部如果纹理比较均一（比如纯色衣服），特征响应反而会变弱（变绿/蓝），形成了 空心。
+collect_vggt4d_features.py/原版 VGGT4D 流程的短板：需要多次 hook/拆分，缓存 token/QK/Gram，显存占用大；RoPE 前后的 Q/K 捕获易丢失空间位置信息；相机/CLS token 导致栅格重排不稳定，offset 搜索只能近似；分开导出浅/中/深图再后处理，插值/对齐误差会叠加；可视化阈值、层级组合需要手动调，动态区域容易碎或漏。
 
-模型的原生分辨率只有 36x36 (Patch Size 14)。
-当我们把它强制放大到 504x504 时，边缘的高响应区被拉伸模糊，形成了一个发光的 光环（Halo）。在 Jet 颜色映射下，0.5 左右的模糊边界会显示为黄色/绿色，而 1.0 的强边界显示为红色，视觉上就像一个红圈套着内部。
+单看 Cross-Attn (QK) 的缺点：浅层对语义/纹理敏感，动态物体边缘容易 "光环"，深层 QK 方差对几何失配敏感但噪声高，平均相似度受全局纹理主导，动态分割不够稳。
 
-在动态物体分割（Dynamic Object Segmentation）这个任务上，Easi3R 和 VGGT4D 代表了两种截然不同的切入点，但它们各自都有明显的缺陷。
+单看 Gram (QQ/KK) 的缺点：只看自相似/全局相似，缺少跨帧方向性；浅层 KK 对亮度/纹理变化很敏感，容易把局部纹理变化当动态；深层 QQ 强调几何一致性，遇到低纹理或尺度变化会误判。
+
+当前 fused 脚本的优势 (tools/run_vggt4d_fused.py): 在 forward 里同时抓 QK 与 QQ/KK，RoPE 注入后直接计算，避免位置信息丢失；chunk 化只存 mean/var，显存友好；自动 offset 搜索剔除 camera/CLS token，栅格还原稳定；用浅/中/深互补公式组合 (mask_std + w_shalloww_middlew_deep_dyn)/2，动态/静态分离更干净；末端 guided filter 用 RGB 边缘细化，减少光环与锯齿。
 
 
 
