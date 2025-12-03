@@ -304,15 +304,31 @@ class DinoVisionTransformer(nn.Module):
             else:
                 g_pos = pos_nodiff
                 l_pos = pos
+
+            # 处理 Camera Token
+            # 机制：在 alt_start 层（即 Layer 8 或 9）开始
             if self.alt_start != -1 and i == self.alt_start:
+                # 如果用户提供了 Camera Token，则使用用户提供的
                 if kwargs.get("cam_token", None) is not None:
                     logger.info("Using camera conditions provided by the user")
                     cam_token = kwargs.get("cam_token")
+                
+                # 否则，复制 Camera Token 到每个样本和每个视角
+                # Ref Frame：通常是序列的第一帧（或者当前正在预测深度的那一帧）。它会被注入专门的 ref_token。
+                # Src Frames：其他用于提供几何线索的帧，会被注入 src_token。
+                # Global Attention：在全局注意力层，所有帧（Ref 和 Src）的 Token 会拼接在一起交互。
+                # Camera Token 的作用就是告诉模型：我是参考帧，你们要根据我的视角来对齐几何信息。
                 else:
                     ref_token = self.camera_token[:, :1].expand(B, -1, -1)
                     src_token = self.camera_token[:, 1:].expand(B, S - 1, -1)
                     cam_token = torch.cat([ref_token, src_token], dim=1)
+
+                # DA3 会把输入的第一个 Token（原本是 CLS Token）直接覆盖为 Camera Token
                 x[:, :, 0] = cam_token
+                """
+                Layer 0-7：Index 0 是 CLS Token（聚合语义）。
+                Layer 8-39：Index 0 变成了 Camera Token（携带相机姿态信息）。
+                """
 
             if self.alt_start != -1 and i >= self.alt_start and i % 2 == 1:
                 x = self.process_attention(

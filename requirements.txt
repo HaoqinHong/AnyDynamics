@@ -1,7 +1,7 @@
 pre-commit
 trimesh
-torch>=2
-torchvision
+# torch>=2
+# torchvision
 einops
 huggingface_hub
 imageio
