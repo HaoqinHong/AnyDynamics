@@ -44,8 +44,7 @@ class Attention(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
         self.rope = rope
 
-    # VGGT4D 需要计算 Gram 矩阵 $QQ^T$ 和 $KK^T$
-    def forward(self, x: Tensor, pos=None, attn_mask=None, return_qkv=False) -> Tensor:
+    def forward(self, x: Tensor, pos=None, attn_mask=None) -> Tensor:
         B, N, C = x.shape
         qkv = (
             self.qkv(x)
@@ -57,11 +56,6 @@ class Attention(nn.Module):
         if self.rope is not None and pos is not None:
             q = self.rope(q, pos)
             k = self.rope(k, pos)
-
-        if return_qkv:
-                # 返回处理好的 q, k 以供计算 Gram Matrix
-                # 注意：这里需要考虑是否要在 fused_attn 之前返回
-                return q, k
             
         if self.fused_attn:
             x = F.scaled_dot_product_attention(

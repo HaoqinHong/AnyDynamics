@@ -12,9 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from einops import rearrange # 新增引用
-import torch.nn.functional as F
-
 from __future__ import annotations
 
 import torch
@@ -106,52 +103,37 @@ class DepthAnything3Net(nn.Module):
         intrinsics: torch.Tensor | None = None,
         export_feat_layers: list[int] | None = [],
         infer_gs: bool = False,
-        # --- [New] VGGT4D 开关 ---
-        enable_vggt4d: bool = False, 
-        mask_layer_indices: list[int] = [0, 1, 2, 3, 4], # 默认在浅层 Mask
     ) -> Dict[str, torch.Tensor]:
         """
-        Forward pass with optional VGGT4D dynamic masking.
+        Forward pass through the network.
+
+        Args:
+            x: Input images (B, N, 3, H, W)
+            extrinsics: Camera extrinsics (B, N, 4, 4) - unused
+            intrinsics: Camera intrinsics (B, N, 3, 3) - unused
+            feat_layers: List of layer indices to extract features from
+
+        Returns:
+            Dictionary containing predictions and auxiliary features
         """
-        # 准备 Camera Token (逻辑不变)
+        # Extract features using backbone
         if extrinsics is not None:
             with torch.autocast(device_type=x.device.type, enabled=False):
                 cam_token = self.cam_enc(extrinsics, intrinsics, x.shape[-2:])
         else:
             cam_token = None
 
-        H, W = x.shape[-2], x.shape[-1]
-        dynamic_mask = None
-
-        # === [Stage 1] VGGT4D 挖掘阶段 ===
-        if enable_vggt4d:
-            # 这一步不需要梯度，只为了求 Mask
-            with torch.no_grad():
-                # 调用 backbone，请求 extract_motion_cues (需配合上一轮修改的 vision_transformer.py)
-                # 注意：这里我们利用 DA3 的 Global Layers (L9, L11...) 来挖掘运动线索
-                _, _, motion_cues = self.backbone(
-                    x, 
-                    cam_token=cam_token, 
-                    extract_motion_cues=True 
-                )
-                
-                # 计算掩码 (Gram Matrix -> Mean/Var -> Threshold)
-                # motion_cues['qs'] 包含了 Global Layers 的 Query
-                dynamic_mask = self._compute_vggt4d_mask(motion_cues, H, W)
-                
-                # [可选] 可视化或调试 Mask
-                # import matplotlib.pyplot as plt; plt.imshow(dynamic_mask[0,0].cpu()); plt.show()
-
-        # === [Stage 2] 正式推理阶段 ===
-        # 如果 enable_vggt4d 为 True，这里会将计算好的 mask 传入
         feats, aux_feats = self.backbone(
-            x, 
-            cam_token=cam_token, 
-            export_feat_layers=export_feat_layers,
-            # 传入 Mask 参数 (需配合上一轮修改的 vision_transformer.py)
-            dynamic_mask=dynamic_mask,
-            mask_layers=mask_layer_indices
+            x, cam_token=cam_token, export_feat_layers=export_feat_layers
         )
+
+        # 查看提取的特征形状
+        print("Shape of x:", x.shape)
+        print("Len of aux_feats: ", len(aux_feats))
+        print("Len of feats: ", len(feats))
+        for i in range(len(feats)):
+            for j in range(len(feats[i])):
+                print(f"Shape of feats[{i}][{j}]:", feats[i][j].shape)
 
         # feats = [[item for item in feat] for feat in feats]
         H, W = x.shape[-2], x.shape[-1]
@@ -163,11 +145,8 @@ class DepthAnything3Net(nn.Module):
             if infer_gs:
                 output = self._process_gs_head(feats, H, W, output, x, extrinsics, intrinsics)
 
+        # Extract auxiliary features if requested
         output.aux = self._extract_auxiliary_features(aux_feats, export_feat_layers, H, W)
-        
-        # 将 Mask 也存入输出，方便调试
-        if dynamic_mask is not None:
-            output['dynamic_mask'] = dynamic_mask
 
         return output
 
@@ -273,90 +252,6 @@ class DepthAnything3Net(nn.Module):
 
         return aux_features
 
-    def _compute_vggt4d_mask(self, motion_cues, H, W, threshold_ratio=0.6):
-            """
-            根据 VGGT4D 论文公式 (3)-(8) 计算动态掩码。
-            这里主要利用 Global Layers 的 Q/K 计算跨帧一致性。
-            """
-            qs = motion_cues['qs'] # List of [B, H, S, N, D] from Global Layers
-            ks = motion_cues['ks'] 
-            
-            B, num_heads, S, N, D = qs[0].shape
-            device = qs[0].device
-            
-            # 初始化聚合的 S (Mean) 和 V (Variance)
-            # 对应论文 Eq(3) Eq(4)
-            agg_score = 0
-            
-            # 遍历捕获到的 Global Layers (对应 VGGT4D 的 Middle/Deep Layers)
-            for q, k in zip(qs, ks):
-                # 1. 计算 Gram 矩阵 A_QQ = Q * Q^T
-                # 我们只关心当前帧 t 和其他帧 s 的相似度
-                # shape: [B, H, S(Ref), S(Src), N(Ref), N(Src)] -> 太大了
-                # 优化：VGGT4D 实际上是计算 Token-wise 的跨帧相关性
-                
-                # 简化版实现：计算每个 Token 在时间轴上的特征方差
-                # 如果一个 Token 是静态背景，它在 Global Layer 的 Feature (Q) 应该在所有帧间保持稳定
-                # 如果是动态物体，它的 Q 会剧烈变化
-                
-                # 论文使用的是 Gram Matrix 的统计量。
-                # 这里我们计算 Query 向量在时间窗口内的自相似度 (Self-Similarity over Time)
-                
-                # [B, H, S, N, D] -> [B, H, N, S, D]
-                q_per_token = rearrange(q, 'b h s n d -> (b h n) s d')
-                k_per_token = rearrange(k, 'b h s n d -> (b h n) s d')
-                
-                # 计算 Gram Matrix: [Tokens, S, S]
-                # 这一步衡量了该 Token 在不同帧之间的相似性
-                gram_qq = torch.bmm(q_per_token, q_per_token.transpose(1, 2)) / (D ** 0.5)
-                
-                # 提取非对角线元素 (即跨帧相似度)
-                # 静态物体：跨帧相似度高 -> Mean 高, Var 低
-                # 动态物体：跨帧相似度低 -> Mean 低, Var 高 (或不稳定)
-                
-                # 论文 Eq 7: w_middle = 1 - S_middle_QQ (S 是 Mean)
-                # 意味着：相似度均值越低，越可能是动态物体
-                
-                mask = ~torch.eye(S, device=device).bool() # 排除自身帧
-                gram_qq_off_diag = gram_qq[:, mask].reshape(gram_qq.shape[0], -1)
-                
-                s_qq = gram_qq_off_diag.mean(dim=-1) # Mean over time window
-                
-                # 归一化到 0-1
-                s_qq = (s_qq - s_qq.min()) / (s_qq.max() - s_qq.min() + 1e-6)
-                
-                # 动态得分 = 1 - 静态得分
-                layer_dynamic_score = 1.0 - s_qq
-                
-                # 累加多层的得分
-                agg_score += layer_dynamic_score.view(B, num_heads, N).mean(dim=1) # Average over heads
-
-            # 平均所有层的得分
-            agg_score /= len(qs)
-            
-            # [B, S, N] -> [B, S, H, W] (Reshape back to image)
-            patch_h, patch_w = H // self.PATCH_SIZE, W // self.PATCH_SIZE
-            saliency_map = agg_score.reshape(B, S, patch_h, patch_w)
-            
-            # 上采样回原图尺寸
-            saliency_map = F.interpolate(
-                saliency_map.reshape(B * S, 1, patch_h, patch_w), 
-                size=(H, W), 
-                mode='bilinear'
-            ).reshape(B, S, H, W)
-            
-            # 简单的阈值处理 (论文用了 Otsu，这里用分位数简化)
-            # 大于阈值的被认为是动态物体
-            threshold = torch.quantile(saliency_map.flatten(), threshold_ratio)
-            binary_mask = (saliency_map > threshold).float()
-            
-            # 生成 attention mask
-            # 如果 binary_mask为1 (动态)，我们需要屏蔽它，所以在 Attention Mask 中设为 -inf 或 True
-            # 具体取决于 vision_transformer.py 如何处理 mask。
-            # 通常 attn_mask: 0 for keep, -inf for mask out. 或者 boolean mask.
-            # 这里假设传入的是 Boolean Mask，True 表示要屏蔽 (Is Dynamic)
-            return binary_mask.bool()
-
 
 class NestedDepthAnything3Net(nn.Module):
     """
@@ -393,8 +288,6 @@ class NestedDepthAnything3Net(nn.Module):
         intrinsics: torch.Tensor | None = None,
         export_feat_layers: list[int] | None = [],
         infer_gs: bool = False,
-        # --- [New] 透传参数 ---
-        enable_vggt4d: bool = False,
     ) -> Dict[str, torch.Tensor]:
         """
         Forward pass through both branches with metric scaling alignment.
@@ -411,14 +304,8 @@ class NestedDepthAnything3Net(nn.Module):
         """
         # Get predictions from both branches
         output = self.da3(
-            x, extrinsics, intrinsics, 
-            export_feat_layers=export_feat_layers, 
-            infer_gs=infer_gs,
-            # 透传
-            enable_vggt4d=enable_vggt4d 
+            x, extrinsics, intrinsics, export_feat_layers=export_feat_layers, infer_gs=infer_gs
         )
-        
-        # metric_output 通常不需要 VGGT4D Mask，因为它只负责 Scale
         metric_output = self.da3_metric(x, infer_gs=infer_gs)
 
         # Apply metric scaling and alignment
