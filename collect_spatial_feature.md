@@ -12,11 +12,7 @@ ffmpeg -i demo/4D-Video.mp4 -vf "fps=10" frames/%05d.jpg
 python tools/collect_spatial_features.py \
     --model-name da3nested-giant-large \
     --image-dir ./demo/kling \
-    --output-dir ./analysis/vis_results_kling
-
-python tools/make_all_videos.py \
-    --root-dir ./analysis/vis_results_kling \
-    --fps 10
+    --output-dir ./analysis/kling/vis_results_kling
 ```
 运行后会输出浅/中/深层 block 列表，并把 prediction（深度/相机）、block_states（每层 tokens、Q/K）以及 gram_stats 统统保存到 --out-path 指定的文件里。
 
@@ -82,7 +78,12 @@ collect_vggt4d_features.py/原版 VGGT4D 流程的短板：需要多次 hook/拆
 ```
 python tools/collect_vggt4d_fused.py \
     --image-dir ./demo/kling \
-    --output-dir ./analysis/fused_result \
+    --output-dir ./analysis/kling/fused_result \
+    --model-path /opt/data/private/models/depthanything3/DA3NESTED-GIANT-LARGE
+
+python tools/collect_vggt4d_fused.py \
+    --image-dir ./demo/bear \
+    --output-dir ./analysis/bear/fused_result \
     --model-path /opt/data/private/models/depthanything3/DA3NESTED-GIANT-LARGE
 ```
 
@@ -106,7 +107,7 @@ Clustering (聚类)：对剩余的 3D 点进行聚类，并在簇内平均梯度
 ```
 python tools/run_vggt4d_full.py \
     --image-dir ./demo/kling \
-    --output-dir ./analysis/vggt4d_full_result \
+    --output-dir ./analysis/kling/vggt4d_full_result \
     --model-path /opt/data/private/models/depthanything3/DA3NESTED-GIANT-LARGE
 ```
  
@@ -150,18 +151,57 @@ RGB-D 联合引导滤波 (RGB-D Guided Filter)：
 
 
 ```
-python tools/run_any4dgsv1.py \
+python tools/run_any4dgs_v1.py \
     --image-dir ./demo/kling \
-    --output-dir ./analysis/any4dgs \
+    --output-dir ./analysis/kling/any4dgs_v1 \
     --model-path /opt/data/private/models/depthanything3/DA3NESTED-GIANT-LARGE
 ```
 
 时序平滑 (Temporal Smoothing)：不再是算出一帧处理一帧，而是先计算出全视频的 Coarse Mask 序列。在时间维度上应用 高斯平滑 (Gaussian Smoothing)。比如，第 $t$ 帧的掩码会参考 $t-2, t-1, t+1, t+2$ 帧的信息。这能极大消除“上一帧有、下一帧没了”的闪烁问题。双阈值滞后 (Hysteresis)：高阈值 (Strong)：确信是动态的核心区域（如 >0.6）。低阈值 (Weak)：可能是动态的边缘区域（如 >0.3）。
 策略：只有当弱区域与强区域相连时，才保留它。这样既能保留锐利的边缘细节，又能过滤掉背景中孤立的低置信度噪点。参数微调：略微增大了 Guided Filter 的半径，增强空间平滑性。
 
+时序平滑引入了过度模糊，或者双阈值策略过于保守，导致物体边缘被 吃掉 了。
+
 ```
-python tools/run_any4dgs.py \
+python tools/run_any4dgs_v2.py \
     --image-dir ./demo/kling \
-    --output-dir ./analysis/any4dgs_v2 \
+    --output-dir ./analysis/kling/any4dgs_v2 \
     --model-path /opt/data/private/models/depthanything3/DA3NESTED-GIANT-LARGE
+```
+
+GrabCut 交互式分割思想 (Super-Refinement)
+当前问题：不管是 Otsu 还是 Hysteresis，本质上都是基于像素值的阈值切分。如果物体内部有些像素热力值低（比如纯黑T恤），它怎么切都会漏。改进策略：我们可以利用 GrabCut 的思想。将 Mask > 高阈值 的区域视为 前景种子 (Foreground Seed)。将 Mask < 低阈值 的区域视为 背景种子 (Background Seed)。中间区域（Uncertain）交给算法，根据 RGB 颜色分布 去决定它是前景还是背景。效果：这能极好地补全物体内部空洞，因为同一件衣服的颜色是相似的，算法会自动把没选上的部分“吸”进来。
+
+多尺度引导滤波 (Multi-Scale Guided Filter)
+当前问题：只用了一个半径 r。如果 r 太小，内部空洞填不上；如果 r 太大，边缘就不准。改进策略：使用两个尺度的 Guided Filter。
+大尺度 (Large r)：负责平滑和填充内部空洞。小尺度 (Small r)：负责贴合精细边缘。
+融合：取两者的最大值或加权平均。
+
+```
+python tools/run_any4dgs_v3.py \
+    --image-dir ./demo/kling \
+    --output-dir ./analysis/kling/any4dgs_v3 \
+    --model-path /opt/data/private/models/depthanything3/DA3NESTED-GIANT-LARGE
+
+python tools/run_any4dgs_v3.py \
+    --image-dir ./demo/bear \
+    --output-dir ./analysis/bear/any4dgs_v3 \
+    --model-path /opt/data/private/models/depthanything3/DA3NESTED-GIANT-LARGE
+```
+
+### 早期掩码抑制
+在 Depth Anything 3 (DA3) 中实现类似 VGGT4D 的 Early-Stage Masking（早期掩码抑制） 时，掩码应该被调整到 Token 分辨率（Feature Map Resolution） 空间。具体来说，应该是一个 “下采样到 1/14” 的低分辨率空间。
+
+DA3 的骨干网络是 DinoV2 (ViT)，它是基于 Patch 的 Vision Transformer。Patch Size: DA3 的 Patch Size 固定为 14。Token 对应关系: 输入图像中的每一个 $14 \times 14$ 像素区域，在 Transformer 内部对应 1 个 Token。Attention 机制: Attention 矩阵是在 Token 之间计算的。如果你想抑制某个区域的 Attention，你必须精确地操作对应的 Token。
+
+```
+python tools/run_any4dgs_v4.py \
+    --image-dir ./demo/kling \
+    --output-dir ./analysis/kling/any4dgs_v4 \
+    --model-path /opt/data/private/models/depthanything3/DA3-GIANT
+
+python tools/run_any4dgs_v4.py \
+    --image-dir ./demo/bear \
+    --output-dir ./analysis/bear/any4dgs_v4 \
+    --model-path /opt/data/private/models/depthanything3/DA3-GIANT
 ```

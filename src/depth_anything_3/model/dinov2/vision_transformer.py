@@ -7,6 +7,17 @@
 #   https://github.com/facebookresearch/dino/blob/main/vision_transformer.py
 #   https://github.com/rwightman/pytorch-image-models/tree/master/timm/models/vision_transformer.py
 
+
+# 阶段一：单目语义提取 (Shallow Layers, 0-7)
+    # 行为：纯粹的 Local Attention。
+    # 视野：每帧图像独立处理，互不可见。
+    # 功能：提取图像内部的语义特征（完全依赖于 Dinov2 的特征先验，如这是一只猫），没有任何几何匹配或多视角交互。
+
+# 阶段二：多视几何建图 (Deep Layers, 8-23)
+    # 行为：Local 和 Global Attention 交替进行。
+    # 视野：Global 层能看到所有视图的 Token。
+    # 功能：利用注入的 Camera Token，开始进行跨视图的特征匹配和几何推理。
+
 import math
 from typing import Callable, List, Sequence, Tuple, Union
 import numpy as np
@@ -338,19 +349,36 @@ class DinoVisionTransformer(nn.Module):
                 x = self.process_attention(x, blk, "local", pos=l_pos)
                 local_x = x
 
+
+            # 最后解码的特征都是中间取的4层特征（遵循DPT的范式），同时这四层特征是cat了全局和局部的特征
+            # 把 前一层的 local 特征和后一层的 global 特征 cat 到一起的
             if i in blocks_to_take:
                 out_x = torch.cat([local_x, x], dim=-1) if self.cat_token else x
                 output.append((out_x[:, :, 0], out_x))
             if i in export_feat_layers:
                 aux_output.append(x)
         return output, aux_output
+        # 由于 da3-large.yaml 中明确设置了 cat_token: True ，
+        # 且输出层 out_layers: [11, 15, 19, 23] 均为奇数层（全局层），因此输出的特征 out_x 必然是 [前一层Local, 当前层Global] 的形式。
+
+    # 处理注意力机制的函数
+    # 浅层 (Layer 0 - 7)
+        # Local 含义：在 process_attention 函数中，local 模式会将张量重排为 (b s) n c。
+        # 这意味着 Batch 中的 $S$ 个视图被视为独立的样本，Attention 只在单张图像内部计算，视图之间没有任何信息交换。
+    # 深层 (Layer 8 及以后)：从第 8 层开始，模型进入交替模式。
+        # Layer 8, 10, 12... (偶数层)：依然走 else 分支，还是 Local（局部信息）。
+        # Layer 9, 11, 13... (奇数层)：满足所有条件，走 if 分支，执行 attn_type="global"。
+        # Global 含义：张量被重排为 b (s n) c，所有视图的 Token 拼在一起计算 Attention，实现了跨视图信息交互。
 
     def process_attention(self, x, block, attn_type="global", pos=None, attn_mask=None):
         b, s, n = x.shape[:3]
+        # 重组张量以适应不同的注意力类型
+        # 对于局部注意力（local attention），我们将批次和视角维度合并，以便在每个视角内独立计算注意力。
         if attn_type == "local":
             x = rearrange(x, "b s n c -> (b s) n c")
             if pos is not None:
                 pos = rearrange(pos, "b s n c -> (b s) n c")
+        # 对于全局注意力（global attention），我们将所有视角的Token展平，以便它们可以相互交互。
         elif attn_type == "global":
             x = rearrange(x, "b s n c -> b (s n) c")
             if pos is not None:
@@ -360,11 +388,17 @@ class DinoVisionTransformer(nn.Module):
 
         x = block(x, pos=pos, attn_mask=attn_mask)
 
+        # 将张量重组回原始形状
+        # 对于局部注意力，我们将批次和视角维度分开。
         if attn_type == "local":
             x = rearrange(x, "(b s) n c -> b s n c", b=b, s=s)
+        # 对于全局注意力，我们将展平的视角维度重新分离出来。
         elif attn_type == "global":
             x = rearrange(x, "b (s n) c -> b s n c", b=b, s=s)
         return x
+    
+    # DA3-Large 的前 8 层 (Layer 0-7) 是纯粹的单目特征提取器，它们完全独立地处理每一帧图像，确实只包含局部信息。
+    # 这解释了为什么 VGGT4D 或其他依赖 Attention 统计量的方法在浅层会表现出强烈的 语义分割 特性（因为此时模型还在像处理单张图片一样理解物体），而没有混入多视图的几何匹配信息。
 
     def get_intermediate_layers(
         self,

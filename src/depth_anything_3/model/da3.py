@@ -126,6 +126,15 @@ class DepthAnything3Net(nn.Module):
         feats, aux_feats = self.backbone(
             x, cam_token=cam_token, export_feat_layers=export_feat_layers
         )
+
+        # 查看提取的特征形状
+        print("Shape of x:", x.shape)
+        print("Len of aux_feats: ", len(aux_feats))
+        print("Len of feats: ", len(feats))
+        for i in range(len(feats)):
+            for j in range(len(feats[i])):
+                print(f"Shape of feats[{i}][{j}]:", feats[i][j].shape)
+
         # feats = [[item for item in feat] for feat in feats]
         H, W = x.shape[-2], x.shape[-1]
 
