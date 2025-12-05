@@ -45,7 +45,7 @@ class Attention(nn.Module):
         self.rope = rope
 
     # VGGT4D 需要计算 Gram 矩阵 $QQ^T$ 和 $KK^T$
-    def forward(self, x: Tensor, pos=None, attn_mask=None, return_qkv=False) -> Tensor:
+    def forward(self, x: Tensor, pos=None, attn_mask=None, return_qkv=False): # 去掉 -> Tensor 类型提示，因为可能返回 Tuple
         B, N, C = x.shape
         qkv = (
             self.qkv(x)
@@ -54,26 +54,23 @@ class Attention(nn.Module):
         )
         q, k, v = qkv[0], qkv[1], qkv[2]
         q, k = self.q_norm(q), self.k_norm(k)
+        
+        # 备份一下处理好的 q, k 用于返回
+        q_out, k_out = q, k 
+
         if self.rope is not None and pos is not None:
             q = self.rope(q, pos)
             k = self.rope(k, pos)
+            # 注意：Gram 矩阵计算通常用带有位置信息的 q/k 也可以，
+            # 如果 VGGT4D 这里的 q_out, k_out 需要包含 rope，请在这里更新它们：
+            q_out, k_out = q, k
 
-        if return_qkv:
-                # 返回处理好的 q, k 以供计算 Gram Matrix
-                # 注意：这里需要考虑是否要在 fused_attn 之前返回
-                return q, k
-            
+        # --- 必须继续执行 Attention 计算，否则 x 无法生成，网络下一层无法运行 ---
         if self.fused_attn:
             x = F.scaled_dot_product_attention(
-                q,
-                k,
-                v,
+                q, k, v,
                 dropout_p=self.attn_drop.p if self.training else 0.0,
-                attn_mask=(
-                    (attn_mask)[:, None].repeat(1, self.num_heads, 1, 1)
-                    if attn_mask is not None
-                    else None
-                ),
+                attn_mask=((attn_mask)[:, None].repeat(1, self.num_heads, 1, 1) if attn_mask is not None else None),
             )
         else:
             q = q * self.scale
@@ -85,6 +82,11 @@ class Attention(nn.Module):
         x = x.transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
+
+        # 统一返回 x 以及可选的 q, k
+        if return_qkv:
+            return x, q_out, k_out
+        
         return x
 
     def _forward(self, x: Tensor) -> Tensor:
