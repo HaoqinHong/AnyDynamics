@@ -74,7 +74,29 @@ class Block(nn.Module):
 
         self.sample_drop_ratio = drop_path
 
-    def forward(self, x: Tensor, pos=None, attn_mask=None) -> Tensor:
+    # 修改函数签名，增加 return_qkv 参数，并更新返回类型提示
+    def forward(self, x: Tensor, pos=None, attn_mask=None, return_qkv=False) -> Union[Tensor, Tuple[Tensor, Tensor, Tensor]]:
+        
+        # === [新增] 专门处理 Q/K 提取的分支 ===
+        if return_qkv:
+            # 1. Attention 部分 (手动拆解)
+            # 先 Norm
+            x_norm1 = self.norm1(x)
+            # 再 Attn (获取 x, q, k)
+            x_attn, q, k = self.attn(x_norm1, pos=pos, attn_mask=attn_mask, return_qkv=True)
+            # 残差连接 + LayerScale
+            x = x + self.ls1(x_attn)
+
+            # 2. MLP 部分 (保持原样)
+            x_norm2 = self.norm2(x)
+            x_mlp = self.mlp(x_norm2)
+            # 残差连接 + LayerScale
+            x = x + self.ls2(x_mlp)
+
+            # 返回三元组
+            return x, q, k
+
+        # === [原有] 保持原始逻辑完全不变 ===
         def attn_residual_func(x: Tensor, pos=None, attn_mask=None) -> Tensor:
             return self.ls1(self.attn(self.norm1(x), pos=pos, attn_mask=attn_mask))
 
@@ -88,6 +110,7 @@ class Block(nn.Module):
                 residual_func=attn_residual_func,
                 sample_drop_ratio=self.sample_drop_ratio,
                 pos=pos,
+                attn_mask=attn_mask, # 注意：原代码这里可能有漏传 attn_mask，如果报错请加上
             )
             x = drop_add_residual_stochastic_depth(
                 x,

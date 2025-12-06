@@ -22,7 +22,9 @@ from depth_anything_3.model.utils.head_utils import activate_head_gs, custom_int
 
 
 class GSDPT(DPT):
-
+# 输入维度 dim_in，patch 大小 patch_size，输出通道 output_dim（默认 4），主头激活 activation，置信度激活 conf_activation，
+# 特征宽度 features，每级输出通道 out_channels，是否加位置编码 pos_embed，是否只返回特征 feature_only，
+# 下采样倍率 down_ratio，置信度维度 conf_dim，规范化类型 norm_type，以及融合块是否 inplace。
     def __init__(
         self,
         dim_in: int,
@@ -39,6 +41,7 @@ class GSDPT(DPT):
         norm_type: str = "idt",  # use to match legacy GS-DPT head, "idt" / "layer"
         fusion_block_inplace: bool = False,
     ) -> None:
+        # 把这些配置传给基类 DPT，并指定 head_name="raw_gs"、不使用天空分支。
         super().__init__(
             dim_in=dim_in,
             patch_size=patch_size,
@@ -54,13 +57,17 @@ class GSDPT(DPT):
             norm_type=norm_type,
             fusion_block_inplace=fusion_block_inplace,
         )
-        self.conf_dim = conf_dim
+        self.conf_dim = conf_dim # 记录置信度维度。
+        # 断言 conf_activation 必须是线性，因为多视角透明度需要线性输出。
         if conf_dim and conf_dim > 1:
             assert (
                 conf_activation == "linear"
             ), "use linear prediction when using view-dependent opacity"
 
+        # 决定后续图像融合分支的输出通道数。
         merger_out_dim = features if feature_only else features // 2
+
+        # 三层 3x3 Conv+GELU，将原始 RGB 图像编码到与主分支同尺度的特征，通道逐步增加（1/4 → 1/2 → full）。
         self.images_merger = nn.Sequential(
             nn.Conv2d(3, merger_out_dim // 4, 3, 1, 1),  # fewer channels first
             nn.GELU(),
@@ -73,6 +80,8 @@ class GSDPT(DPT):
     # -------------------------------------------------------------------------
     # Internal forward (single chunk)
     # -------------------------------------------------------------------------
+    # 处理单个 chunk 的内部前向，返回字典。
+    # 输入：多尺度 feats 列表、原图高宽 H/W、当前 patch 起始索引 patch_start_idx、原始图像 images。
     def _forward_impl(
         self,
         feats: List[torch.Tensor],

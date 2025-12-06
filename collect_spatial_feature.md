@@ -108,7 +108,7 @@ Clustering (聚类)：对剩余的 3D 点进行聚类，并在簇内平均梯度
 python tools/run_vggt4d_full.py \
     --image-dir ./demo/kling \
     --output-dir ./analysis/kling/vggt4d_full_result \
-    --model-path /opt/data/private/models/depthanything3/DA3NESTED-GIANT-LARGE
+    --model-path /opt/data/private/models/depthanything3/DA3-GIANT 
 ```
  
 #### VGGT4D 复现结果分析

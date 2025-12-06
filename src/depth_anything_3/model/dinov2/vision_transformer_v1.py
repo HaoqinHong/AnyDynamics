@@ -7,6 +7,7 @@
 #   https://github.com/facebookresearch/dino/blob/main/vision_transformer.py
 #   https://github.com/rwightman/pytorch-image-models/tree/master/timm/models/vision_transformer.py
 
+# 实现 VGGT4D 的 Pipeline：Forward(无Mask) -> 提取Q/K -> 计算Gram -> 生成Mask -> Forward(有Mask)
 
 # 阶段一：单目语义提取 (Shallow Layers, 0-7)
     # 行为：纯粹的 Local Attention。
@@ -302,12 +303,23 @@ class DinoVisionTransformer(nn.Module):
                 pos_nodiff = torch.cat([pos_special, pos_nodiff], dim=2)
         return pos, pos_nodiff
 
-    def _get_intermediate_layers_not_chunked(self, x, n=1, export_feat_layers=[], **kwargs):
+    def _get_intermediate_layers_not_chunked(self, x, n=1, export_feat_layers=[], 
+                                                # 新增参数
+                                                extract_motion_cues=False, # 是否开启挖掘模式
+                                                dynamic_mask=None,         # 传入计算好的掩码
+                                                mask_layers=range(6),      # 掩码作用层级 (VGGT4D 推荐 1-5)
+                                                **kwargs):
         B, S, _, H, W = x.shape
         x = self.prepare_tokens_with_masks(x)
         output, total_block_len, aux_output = [], len(self.blocks), []
         blocks_to_take = range(total_block_len - n, total_block_len) if isinstance(n, int) else n
         pos, pos_nodiff = self._prepare_rope(B, S, H, W, x.device)
+
+        # 用于存储挖掘到的 Q/K
+        motion_cues = {
+            "qs": [], # 存储 Global Layers 的 Q
+            "ks": []  # 存储 Global Layers 的 K
+        }
 
         for i, blk in enumerate(self.blocks):
             if i < self.rope_start or self.rope is None:
@@ -322,7 +334,7 @@ class DinoVisionTransformer(nn.Module):
                 # 如果用户提供了 Camera Token，则使用用户提供的
                 if kwargs.get("cam_token", None) is not None:
                     logger.info("Using camera conditions provided by the user")
-                    cam_token = kwargs.get("cam_token")
+                    cam_token = kwargs.get("cam_token")                   
                 
                 # 否则，复制 Camera Token 到每个样本和每个视角
                 # Ref Frame：通常是序列的第一帧（或者当前正在预测深度的那一帧）。它会被注入专门的 ref_token。
@@ -333,6 +345,41 @@ class DinoVisionTransformer(nn.Module):
                     ref_token = self.camera_token[:, :1].expand(B, -1, -1)
                     src_token = self.camera_token[:, 1:].expand(B, S - 1, -1)
                     cam_token = torch.cat([ref_token, src_token], dim=1)
+
+                # (判断当前层类型) DA3 逻辑: alt_start 之后的奇数层是 Global
+                is_global = (self.alt_start != -1 and i >= self.alt_start and i % 2 == 1)
+                attn_type = "global" if is_global else "local"
+
+                # === 逻辑分支 A: 掩码注入 (Masking) ===
+                # 仅在 Shallow Layers (Local) 且 提供了 Mask 时触发
+                current_layer_mask = None
+                if dynamic_mask is not None and i in mask_layers:
+                    # 只有 Local 层能应用基于帧内空间位置的 Mask
+                    if attn_type == "local":
+                        current_layer_mask = dynamic_mask
+                        # 注意：dynamic_mask 应该是布尔值或 -inf，指示哪些 Token 应该被忽略
+
+                # === 逻辑分支 B: 运动挖掘 (Mining) ===
+                # 仅在 Global Layers 且 需要提取时触发
+                should_extract = extract_motion_cues and is_global
+                
+                # === 执行 Attention ===
+                ret = self.process_attention(
+                    x, blk, 
+                    attn_type=attn_type, 
+                    pos=g_pos if is_global else l_pos, 
+                    attn_mask=current_layer_mask, # 注入掩码
+                    return_qkv=should_extract     # 请求 Q/K
+                )
+
+                if should_extract:
+                    x, q, k = ret
+                    # 收集 Global Q/K 用于计算 Gram Matrix
+                    # VGGT4D: "We extract w_middle from Layers 4-8" (对应 DA3 Global Layers)
+                    motion_cues["qs"].append(q) 
+                    motion_cues["ks"].append(k)
+                else:
+                    x = ret # 正常推理，只返回 x
 
                 # DA3 会把输入的第一个 Token（原本是 CLS Token）直接覆盖为 Camera Token
                 x[:, :, 0] = cam_token
@@ -357,6 +404,11 @@ class DinoVisionTransformer(nn.Module):
                 output.append((out_x[:, :, 0], out_x))
             if i in export_feat_layers:
                 aux_output.append(x)
+            
+                # 如果是挖掘模式，返回 motion_cues
+            if extract_motion_cues:
+                return output, aux_output, motion_cues
+            
         return output, aux_output
         # 由于 da3-large.yaml 中明确设置了 cat_token: True ，
         # 且输出层 out_layers: [11, 15, 19, 23] 均为奇数层（全局层），因此输出的特征 out_x 必然是 [前一层Local, 当前层Global] 的形式。
@@ -370,35 +422,92 @@ class DinoVisionTransformer(nn.Module):
         # Layer 9, 11, 13... (奇数层)：满足所有条件，走 if 分支，执行 attn_type="global"。
         # Global 含义：张量被重排为 b (s n) c，所有视图的 Token 拼在一起计算 Attention，实现了跨视图信息交互。
 
-    def process_attention(self, x, block, attn_type="global", pos=None, attn_mask=None):
+    # def process_attention(self, x, block, attn_type="global", pos=None, attn_mask=None):
+    #     b, s, n = x.shape[:3]
+    #     # 重组张量以适应不同的注意力类型
+    #     # 对于局部注意力（local attention），我们将批次和视角维度合并，以便在每个视角内独立计算注意力。
+    #     if attn_type == "local":
+    #         x = rearrange(x, "b s n c -> (b s) n c")
+    #         if pos is not None:
+    #             pos = rearrange(pos, "b s n c -> (b s) n c")
+    #     # 对于全局注意力（global attention），我们将所有视角的Token展平，以便它们可以相互交互。
+    #     elif attn_type == "global":
+    #         x = rearrange(x, "b s n c -> b (s n) c")
+    #         if pos is not None:
+    #             pos = rearrange(pos, "b s n c -> b (s n) c")
+    #     else:
+    #         raise ValueError(f"Invalid attention type: {attn_type}")
+
+    #     x = block(x, pos=pos, attn_mask=attn_mask)
+
+    #     # 将张量重组回原始形状
+    #     # 对于局部注意力，我们将批次和视角维度分开。
+    #     if attn_type == "local":
+    #         x = rearrange(x, "(b s) n c -> b s n c", b=b, s=s)
+    #     # 对于全局注意力，我们将展平的视角维度重新分离出来。
+    #     elif attn_type == "global":
+    #         x = rearrange(x, "b (s n) c -> b s n c", b=b, s=s)
+    #     return x
+    
+    # DA3-Large 的前 8 层 (Layer 0-7) 是纯粹的单目特征提取器，它们完全独立地处理每一帧图像，确实只包含局部信息。
+    # 这解释了为什么 VGGT4D 或其他依赖 Attention 统计量的方法在浅层会表现出强烈的 语义分割 特性（因为此时模型还在像处理单张图片一样理解物体），而没有混入多视图的几何匹配信息。
+
+    # 修改方法签名，增加控制参数
+    def process_attention(self, x, block, attn_type="global", pos=None, attn_mask=None, return_qkv=False):
         b, s, n = x.shape[:3]
-        # 重组张量以适应不同的注意力类型
-        # 对于局部注意力（local attention），我们将批次和视角维度合并，以便在每个视角内独立计算注意力。
+
+        # 1. 维度重排 (保持原有逻辑)
         if attn_type == "local":
             x = rearrange(x, "b s n c -> (b s) n c")
             if pos is not None:
                 pos = rearrange(pos, "b s n c -> (b s) n c")
-        # 对于全局注意力（global attention），我们将所有视角的Token展平，以便它们可以相互交互。
+            
+            # [Masking] 如果有动态掩码，要在 Local 模式下对齐维度
+            if attn_mask is not None:
+                # 假设 attn_mask 是 [B, S, N]，重排为 [(B*S), 1, 1, N] 以广播
+                # 注意：具体形状取决于你的 attention.py 实现，通常是广播到 (Batch, Heads, Q_len, K_len)
+                attn_mask = rearrange(attn_mask, "b s n -> (b s) 1 1 n")
+
         elif attn_type == "global":
             x = rearrange(x, "b s n c -> b (s n) c")
             if pos is not None:
                 pos = rearrange(pos, "b s n c -> b (s n) c")
+            # Global 模式通常不应用 Early-Stage Masking，这里略过 attn_mask 处理
+        
         else:
             raise ValueError(f"Invalid attention type: {attn_type}")
 
-        x = block(x, pos=pos, attn_mask=attn_mask)
+        # 2. 调用 Block (关键修改点)
+        # 你需要确保 Block.forward 和 Attention.forward 已经修改为支持 return_qkv
+        outputs = block(x, pos=pos, attn_mask=attn_mask, return_qkv=return_qkv)
 
-        # 将张量重组回原始形状
-        # 对于局部注意力，我们将批次和视角维度分开。
+        # 3. 处理返回值
+        if return_qkv:
+            x, q, k = outputs # 假设 Block 返回 (x, q, k)
+        else:
+            x = outputs
+            q, k = None, None
+
+        # 4. 维度还原 (保持原有逻辑)
         if attn_type == "local":
             x = rearrange(x, "(b s) n c -> b s n c", b=b, s=s)
-        # 对于全局注意力，我们将展平的视角维度重新分离出来。
+            # [Mining] 如果提取了 Q/K，也要还原维度以便计算跨帧 Gram
+            if q is not None:
+                # q shape: [(B*S), Heads, N, D] -> [B, S, Heads, N, D]
+                q = rearrange(q, "(b s) h n d -> b s h n d", b=b, s=s)
+                k = rearrange(k, "(b s) h n d -> b s h n d", b=b, s=s)
+                
         elif attn_type == "global":
             x = rearrange(x, "b (s n) c -> b s n c", b=b, s=s)
+            if q is not None:
+                # Global Q/K 包含所有帧: [B, Heads, (S*N), D] -> [B, Heads, S, N, D]
+                # 这一步对于计算 VGGT4D 的 Gram 矩阵至关重要
+                q = rearrange(q, "b h (s n) d -> b h s n d", s=s)
+                k = rearrange(k, "b h (s n) d -> b h s n d", s=s)
+
+        if return_qkv:
+            return x, q, k
         return x
-    
-    # DA3-Large 的前 8 层 (Layer 0-7) 是纯粹的单目特征提取器，它们完全独立地处理每一帧图像，确实只包含局部信息。
-    # 这解释了为什么 VGGT4D 或其他依赖 Attention 统计量的方法在浅层会表现出强烈的 语义分割 特性（因为此时模型还在像处理单张图片一样理解物体），而没有混入多视图的几何匹配信息。
 
     def get_intermediate_layers(
         self,

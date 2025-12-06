@@ -1,423 +1,352 @@
-# tools/run_vggt4d_full.py
-"""
-Usage:
-python tools/run_vggt4d_full.py \
-    --image-dir ./demo/kling \
-    --output-dir ./analysis/vggt4d_strict_result \
-    --model-path /opt/data/private/models/depthanything3/DA3NESTED-GIANT-LARGE \
-    --window-size 2
-"""
 import argparse
-import types
+import glob
+import os
+import shutil
+import cv2
+import numpy as np
 import torch
 import torch.nn.functional as F
-import numpy as np
-import cv2
-import os
-import glob
-import gc
-import open3d as o3d
-from PIL import Image
+from einops import rearrange
+from scipy.spatial.transform import Rotation
 from tqdm import tqdm
-from sklearn.cluster import DBSCAN
-
 from depth_anything_3.api import DepthAnything3
-from depth_anything_3.model.dinov2.layers.attention import Attention
 
-# =========================================================================
-# Part 0: Pose 处理工具
-# =========================================================================
-def process_poses(extrinsics_3x4):
-    N = extrinsics_3x4.shape[0]
-    w2c_homo = np.concatenate([extrinsics_3x4, np.zeros((N, 1, 4))], axis=1) 
-    w2c_homo[:, 3, 3] = 1.0
-    c2w_homo = np.linalg.inv(w2c_homo)
-    return c2w_homo
+# ==========================================
+# 1. Utils: Saving & Helper Functions
+# ==========================================
+def as_homogeneous_numpy(poses):
+    """Convert [N, 3, 4] to [N, 4, 4]"""
+    if poses.shape[-2:] == (4, 4): return poses
+    N = poses.shape[0]
+    bottom = np.array([0, 0, 0, 1]).reshape(1, 1, 4).repeat(N, axis=0)
+    return np.concatenate([poses, bottom], axis=1)
 
-# =========================================================================
-# Part 1: 通用几何工具
-# =========================================================================
-def unproject_depth(depth, intrinsics, device):
-    B, H, W = depth.shape
-    y, x = torch.meshgrid(torch.arange(H, device=device), torch.arange(W, device=device), indexing='ij')
-    x = x.reshape(1, -1).repeat(B, 1).float() + 0.5
-    y = y.reshape(1, -1).repeat(B, 1).float() + 0.5
-    z = depth.reshape(B, -1)
+def save_tum_poses(output_dir, poses, filenames=None):
+    output_path = os.path.join(output_dir, "poses.txt")
+    # Fix: Ensure 4x4 matrix for inversion
+    poses_4x4 = as_homogeneous_numpy(poses)
+    
+    with open(output_path, "w") as f:
+        for i, pose in enumerate(poses_4x4):
+            # World-to-Camera (DA3) -> Camera-to-World (TUM)
+            try:
+                c2w = np.linalg.inv(pose)
+            except np.linalg.LinAlgError:
+                print(f"Warning: Singular matrix at frame {i}, skipping inversion.")
+                c2w = np.eye(4)
 
-    cx = intrinsics[:, 0, 2].unsqueeze(1)
-    cy = intrinsics[:, 1, 2].unsqueeze(1)
-    fx = intrinsics[:, 0, 0].unsqueeze(1)
-    fy = intrinsics[:, 1, 1].unsqueeze(1)
+            t = c2w[:3, 3]
+            r = Rotation.from_matrix(c2w[:3, :3])
+            q = r.as_quat() # x, y, z, w
+            timestamp = i if filenames is None else os.path.splitext(os.path.basename(filenames[i]))[0]
+            f.write(f"{timestamp} {t[0]:.6f} {t[1]:.6f} {t[2]:.6f} {q[0]:.6f} {q[1]:.6f} {q[2]:.6f} {q[3]:.6f}\n")
 
-    X = (x - cx) * z / fx
-    Y = (y - cy) * z / fy
-    pts_cam = torch.stack([X, Y, z], dim=-1) # (B, N, 3)
-    return pts_cam
+def save_intrinsic_txt(output_dir, intrinsics):
+    with open(os.path.join(output_dir, "intrinsic.txt"), "w") as f:
+        K = intrinsics[0]
+        f.write(f"{K[0,0]} {K[1,1]} {K[0,2]} {K[1,2]}\n")
 
-# =========================================================================
-# Part 2: VGGT4D 核心 Monkey Patch
-# =========================================================================
-def vggt4d_attention_forward(self, x, pos=None, attn_mask=None):
-    B, N, C = x.shape
-    qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
-    q, k, v = qkv[0], qkv[1], qkv[2]
-    q, k = self.q_norm(q), self.k_norm(k)
+def save_results(output_dir, image_paths, pred_depth, pred_conf, pred_poses, refined_mask=None):
+    for sub in ["depth", "depth_conf", "dynamic_mask", "rgb"]:
+        os.makedirs(os.path.join(output_dir, sub), exist_ok=True)
+    
+    save_intrinsic_txt(output_dir, pred_poses.intrinsics)
+    save_tum_poses(output_dir, pred_poses.extrinsics, image_paths)
+    
+    for i, path in enumerate(image_paths):
+        name = os.path.splitext(os.path.basename(path))[0]
+        shutil.copy(path, os.path.join(output_dir, "rgb", os.path.basename(path)))
+        cv2.imwrite(os.path.join(output_dir, "depth", f"{name}.png"), (pred_depth[i] * 1000).astype(np.uint16))
+        cv2.imwrite(os.path.join(output_dir, "depth_conf", f"{name}.png"), (pred_conf[i] * 255).astype(np.uint8))
+        if refined_mask is not None:
+            cv2.imwrite(os.path.join(output_dir, "dynamic_mask", f"{name}.png"), (refined_mask[i].astype(np.uint8) * 255))
 
-    if self.rope is not None and pos is not None:
-        q = self.rope(q, pos)
-        k = self.rope(k, pos)
-
-    # --- Mode A: 收集动态线索 ---
-    if getattr(self, "collect_stats", False):
-        with torch.no_grad():
-            scale = self.scale
-            num_frames = self.num_frames
-            window = getattr(self, "window_size", 2)
-            
-            if B == num_frames and B > 1:
-                q_in = q.permute(1, 0, 2, 3).reshape(1, self.num_heads, -1, C // self.num_heads)
-                k_in = k.permute(1, 0, 2, 3).reshape(1, self.num_heads, -1, C // self.num_heads)
-                total_tokens = B * N
-            else:
-                q_in, k_in = q, k
-                total_tokens = N
-            
-            tokens_per_frame = total_tokens // num_frames
-            
-            stats = {
-                "qk_var": torch.zeros(1, self.num_heads, total_tokens, device=q.device),
-                "qq_mean": torch.zeros(1, self.num_heads, total_tokens, device=q.device),
-                "qq_var": torch.zeros(1, self.num_heads, total_tokens, device=q.device),
-                "kk_mean": torch.zeros(1, self.num_heads, total_tokens, device=q.device),
-            }
-            
-            q_t = q_in.transpose(-2, -1)
-            k_t = k_in.transpose(-2, -1)
-
-            for t in range(num_frames):
-                t_start, t_end = t * tokens_per_frame, (t+1) * tokens_per_frame
-                w_start = max(0, t - window) * tokens_per_frame
-                w_end = min(num_frames, t + window + 1) * tokens_per_frame
-                
-                q_curr = q_in[:, :, t_start:t_end]
-                k_curr = k_in[:, :, t_start:t_end]
-                q_win = q_t[:, :, :, w_start:w_end]
-                k_win = k_t[:, :, :, w_start:w_end]
-
-                stats["qk_var"][:, :, t_start:t_end] = (q_curr @ k_win * scale).var(dim=-1)
-                
-                gram_qq = q_curr @ q_win * scale
-                stats["qq_mean"][:, :, t_start:t_end] = gram_qq.mean(dim=-1)
-                stats["qq_var"][:, :, t_start:t_end] = gram_qq.var(dim=-1)
-                
-                gram_kk = k_curr @ k_win * scale
-                stats["kk_mean"][:, :, t_start:t_end] = gram_kk.mean(dim=-1)
-
-            self._captured_stats = {k: v.mean(dim=1).cpu() for k, v in stats.items()}
-            del stats, q_t, k_t, q_in, k_in
-
-    # --- Mode B: 注入动态掩码 ---
-    is_mask_injected = False
-    if getattr(self, "apply_masking", False) and hasattr(self, "dynamic_mask"):
-        mask_map = self.dynamic_mask.to(x.device)
-        S, N_p = mask_map.shape
-        
-        if B == S: # Local
-            bias = torch.zeros(S, 1, 1, N_p, device=x.device)
-            bias.masked_fill_(mask_map.view(S, 1, 1, N_p).bool(), float("-inf"))
-        else: # Global
-            bias = torch.zeros(1, 1, 1, S*N_p, device=x.device)
-            bias.masked_fill_(mask_map.view(1, 1, 1, S*N_p).bool(), float("-inf"))
-            
-        if attn_mask is None:
-            attn_mask = bias
+def adaptive_multiotsu_threshold(img_batch):
+    """[S, H, W] -> [S, H, W] binary mask"""
+    if isinstance(img_batch, torch.Tensor): img_batch = img_batch.cpu().numpy()
+    masks = []
+    for img in img_batch:
+        img_norm = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        if img_norm.max() == img_norm.min():
+            masks.append(np.zeros_like(img_norm))
         else:
-            attn_mask = attn_mask + bias
-        is_mask_injected = True
+            try:
+                _, mask = cv2.threshold(img_norm, 0, 1, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                masks.append(mask)
+            except:
+                masks.append(np.zeros_like(img_norm))
+    return np.array(masks)
 
-    if self.fused_attn:
-        if not is_mask_injected and attn_mask is not None:
-             attn_mask = attn_mask[:, None].repeat(1, self.num_heads, 1, 1)
-        x = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, attn_mask=attn_mask)
-    else:
-        q = q * self.scale
-        attn = q @ k.transpose(-2, -1)
-        if attn_mask is not None:
-            attn = attn + attn_mask
-        attn = attn.softmax(dim=-1)
-        x = attn @ v
+# ==========================================
+# 2. VGGT4D Plugin (Stage 1 & 2)
+# ==========================================
+class VGGT4DPlugin:
+    def __init__(self, model):
+        self.model = model
+        self.hooks = []
+        self.motion_cues = {"qs": []}
+        self.dynamic_mask = None
+        self.patch_size = 14
 
-    x = x.transpose(1, 2).reshape(B, N, C)
-    x = self.proj(x)
-    x = self.proj_drop(x)
-    return x
+    def _clear_hooks(self):
+        for h in self.hooks: h.remove()
+        self.hooks = []
 
-def apply_patch(model, num_frames, window_size=2):
-    for module in model.modules():
-        if isinstance(module, Attention):
-            module.forward = types.MethodType(vggt4d_attention_forward, module)
-            module.collect_stats = False
-            module.apply_masking = False
-            module.num_frames = num_frames
-            module.window_size = window_size
-            module._captured_stats = {}
+    def _mining_hook(self, module, args, output):
+        x = args[0]
+        B, N, C = x.shape
+        qkv = module.qkv(x).reshape(B, N, 3, module.num_heads, C // module.num_heads).permute(2, 0, 3, 1, 4)
+        q = module.q_norm(qkv[0])
+        self.motion_cues["qs"].append(q.detach())
 
-# =========================================================================
-# Part 3: 投影梯度细化 (Strict: Sum of Norms + Photometric)
-# =========================================================================
-def compute_projection_gradient_strict(pts_world, depths, poses, intrinsics, coarse_masks, images, H, W, window_size, t_curr, num_frames):
-    device = pts_world.device
-    pts_world = pts_world.detach().requires_grad_(True)
-    
-    total_score = torch.zeros(pts_world.shape[0], device=device)
-    valid_count = torch.zeros(pts_world.shape[0], device=device)
-    
-    w_start = max(0, t_curr - window_size)
-    w_end = min(num_frames, t_curr + window_size + 1)
-    sources = [i for i in range(w_start, w_end) if i != t_curr]
-    
-    if not sources: return total_score
+    def _masking_hook(self, module, args, kwargs):
+        if self.dynamic_mask is not None:
+            # Injecting mask into Local Attention layers
+            kwargs['attn_mask'] = self.dynamic_mask
+        return args, kwargs
 
-    # [FIX] 关键修复: Resize 图片到 Depth 分辨率以匹配点数
-    img_curr = images[0, t_curr] # (3, H_raw, W_raw)
-    if img_curr.shape[1] != H or img_curr.shape[2] != W:
-        img_curr_resized = F.interpolate(img_curr.unsqueeze(0), size=(H, W), mode='area').squeeze(0)
-    else:
-        img_curr_resized = img_curr
+    def _compute_gram_mask(self, H, W):
+        qs = self.motion_cues['qs']
+        if not qs: return None, None
         
-    c_ref = img_curr_resized.permute(1, 2, 0).reshape(-1, 3) # (N, 3)
+        q_example = qs[0]
+        B_batch, n_heads, n_tokens, dim = q_example.shape
+        
+        n_patches = (H // self.patch_size) * (W // self.patch_size)
+        S = int(round(n_tokens / n_patches))
+        
+        if S <= 1: return None, None
 
-    for i in sources:
-        pose = poses[0, i]
-        K = intrinsics[0, i]
-        obs_depth_map = depths[0, i]
-        obs_img = images[0, i]
-        mask_map = coarse_masks[0, i]
+        n_tokens_per_frame = n_tokens // S
+        start_idx = 1 if (n_tokens_per_frame > n_patches) else 0
         
-        # 1. 投影
-        w2c = torch.inverse(pose)
-        R, T = w2c[:3, :3], w2c[:3, 3]
-        pts_cam = (pts_world @ R.T) + T
-        z_proj = pts_cam[:, 2]
-        
-        u = (pts_cam[:, 0] * K[0,0] / z_proj) + K[0,2]
-        v = (pts_cam[:, 1] * K[1,1] / z_proj) + K[1,2]
-        
-        u_norm = 2 * (u / (W - 1)) - 1
-        v_norm = 2 * (v / (H - 1)) - 1
-        grid = torch.stack([u_norm, v_norm], dim=-1).view(1, 1, -1, 2)
-        
-        valid_uv = (u_norm > -1) & (u_norm < 1) & (v_norm > -1) & (v_norm < 1) & (z_proj > 0.1)
-        
-        # 2. 采样
-        z_obs = F.grid_sample(obs_depth_map.view(1,1,H,W), grid, align_corners=True, padding_mode='border').view(-1)
-        
-        # [FIX] 使用 permute 正确采样颜色
-        c_obs_raw = F.grid_sample(obs_img.unsqueeze(0), grid, align_corners=True) # (1, 3, 1, N)
-        c_obs = c_obs_raw.squeeze(0).squeeze(1).permute(1, 0) # (N, 3)
-        
-        m_obs = F.grid_sample(mask_map.view(1,1,H,W).float(), grid, align_corners=True).view(-1)
-        
-        is_static = m_obs < 0.5
-        valid = valid_uv & is_static
-        
-        if valid.sum() > 0:
-            # A. 几何梯度 Norm (Eq. 10)
-            res_geom = 0.5 * ((z_proj - z_obs) ** 2)
-            grad_i = torch.autograd.grad(
-                (res_geom * valid.float()).sum(), 
-                pts_world, 
-                retain_graph=True
-            )[0]
-            geom_score = grad_i.norm(dim=1)
+        agg_score = 0
+        for q in qs:
+            try:
+                q = rearrange(q, 'b h (s n_full) d -> b h s n_full d', s=S, n_full=n_tokens_per_frame)
+            except: return None, None
+
+            # 1. Strip & Keep patches
+            q_patches = q[:, :, :, start_idx:, :] # [B, H, S, Np, D]
+            if q_patches.shape[3] != n_patches: q_patches = q_patches[:, :, :, :n_patches, :]
+
+            # 2. Gram Matrix
+            q_patches = F.normalize(q_patches, p=2, dim=-1)
+            q_patches = rearrange(q_patches, 'b h s n d -> b h n s d')
+            gram_qq = torch.matmul(q_patches, q_patches.transpose(-1, -2)) # [B, H, Np, S, S]
             
-            # B. 光度误差 (Eq. 11)
-            photo_err = (c_ref - c_obs).norm(dim=1)
-            
-            # C. 组合 (Geom + Photo)
-            score_i = geom_score * 10.0 + photo_err * 1.0
-            
-            total_score += score_i.detach() * valid.float()
-            valid_count += valid.float()
-            
-    final_score = total_score / (valid_count + 1e-6)
-    return final_score
+            # 3. Temporal Consistency
+            sum_sim = gram_qq.sum(dim=-1) - 1.0 
+            s_qq = sum_sim / (S - 1) # [B, H, Np, S]
+            w_middle = 1.0 - s_qq 
+            agg_score += w_middle.mean(dim=1) # [B, Np, S]
 
-# =========================================================================
-# Part 4: 官方 Mask Refinement 策略 (3D SOR + Clustering)
-# =========================================================================
-def refine_mask_3d_official(coarse_mask_2d, grad_map_2d, pts_world, H, W):
-    grad_vals = grad_map_2d.flatten()
-    coarse_vals = coarse_mask_2d.flatten()
-    
-    # 候选点: Coarse激活 或 梯度高
-    candidate_mask = (coarse_vals > 0.5) | (grad_vals > 0.3)
-    candidate_indices = np.where(candidate_mask)[0]
-    
-    if len(candidate_indices) < 10:
-        return np.zeros((H, W), dtype=np.float32)
+        agg_score /= len(qs)
         
-    pts_cand = pts_world[candidate_indices]
-    
-    # --- A. SOR (Statistical Outlier Removal) ---
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(pts_cand)
-    cl, ind = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
-    valid_indices = candidate_indices[ind]
-    
-    if len(valid_indices) < 10:
-        return np.zeros((H, W), dtype=np.float32)
-
-    # --- B. Clustering (聚类) ---
-    pts_valid = pts_world[valid_indices]
-    clustering = DBSCAN(eps=0.5, min_samples=10).fit(pts_valid)
-    labels = clustering.labels_
-    grad_valid = grad_vals[valid_indices]
-    
-    final_indices = []
-    unique_labels = set(labels)
-    if -1 in unique_labels: unique_labels.remove(-1) 
-    
-    for label in unique_labels:
-        cluster_mask = (labels == label)
-        avg_grad = np.mean(grad_valid[cluster_mask])
-        if avg_grad > 0.15: # 阈值
-            final_indices.extend(valid_indices[cluster_mask])
-            
-    final_mask_flat = np.zeros(H * W, dtype=np.float32)
-    final_mask_flat[final_indices] = 1.0
-    
-    final_mask_2d = final_mask_flat.reshape(H, W)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    final_mask_2d = cv2.morphologyEx(final_mask_2d, cv2.MORPH_CLOSE, kernel)
-    
-    return final_mask_2d
-
-# =========================================================================
-# Part 5: 主流程
-# =========================================================================
-def normalize_map(data):
-    flat = data.flatten()
-    lower, upper = np.percentile(flat, 5), np.percentile(flat, 95)
-    return np.clip((data - lower) / (upper - lower + 1e-6), 0, 1)
-
-@torch.no_grad()
-def main(args):
-    print(f"[1/5] Loading Model: {args.model_name}")
-    load_source = args.model_path if args.model_path else f"depth-anything/{args.model_name.upper()}"
-    model = DepthAnything3.from_pretrained(load_source).to(args.device)
-    model.eval()
-    
-    img_files = sorted(glob.glob(os.path.join(args.image_dir, "*.jpg")) + glob.glob(os.path.join(args.image_dir, "*.png")))
-    pil_imgs = [Image.open(p).convert("RGB") for p in img_files]
-    num_frames = len(pil_imgs)
-    print(f"Processing {num_frames} frames from {args.image_dir}")
-    
-    # 传入原始图片 Tensor
-    imgs_tensor = torch.stack([
-        torch.from_numpy(np.array(img)).permute(2,0,1).float()/255.0 
-        for img in pil_imgs
-    ]).to(args.device).unsqueeze(0)
-    
-    apply_patch(model.model, num_frames, window_size=args.window_size)
-    
-    # --- Pass 1 ---
-    print("[2/5] Pass 1: Extracting Motion Cues...")
-    for m in model.model.modules():
-        if isinstance(m, Attention): m.collect_stats = True
-            
-    results_p1 = model.inference(pil_imgs, infer_gs=False)
-    
-    c2w_poses_np = process_poses(results_p1.extrinsics)
-    depths = torch.from_numpy(results_p1.depth).to(args.device).unsqueeze(0)
-    poses = torch.from_numpy(c2w_poses_np).float().to(args.device).unsqueeze(0)
-    intrinsics = torch.from_numpy(results_p1.intrinsics).to(args.device).unsqueeze(0)
-    
-    # --- Gram Matrix ---
-    print("[3/5] Generating Coarse Masks...")
-    vit = model.model.da3.backbone.pretrained if hasattr(model.model, 'da3') else model.model.backbone.pretrained
-    H_feat, W_feat = results_p1.depth.shape[1] // 14, results_p1.depth.shape[2] // 14
-    
-    accum_shallow, accum_middle, accum_deep = 0, 0, 0
-    for idx, block in enumerate(vit.blocks):
-        if not block.attn._captured_stats: continue
-        stats = block.attn._captured_stats
-        def get_map(name):
-            d = stats[name].view(num_frames, -1)
-            if d.shape[1] == (H_feat * W_feat + 1): d = d[:, 1:]
-            d = d.view(num_frames, H_feat, W_feat)
-            return F.interpolate(d.unsqueeze(1), size=results_p1.depth.shape[1:], mode='bilinear').squeeze(1).to(args.device)
-
-        if idx == 1: accum_shallow += (1 - get_map("kk_mean")) * get_map("qk_var")
-        if 6 <= idx <= 13: accum_middle += (1 - get_map("qq_mean"))
-        if 30 <= idx <= 37: accum_deep += (1 - (1 - get_map("qq_var")) * get_map("qq_mean"))
-        block.attn._captured_stats = {}
-
-    w_s = normalize_map(accum_shallow.cpu().numpy())
-    w_m = normalize_map(accum_middle.cpu().numpy())
-    w_d = normalize_map(accum_deep.cpu().numpy())
-    coarse_masks = (w_s * w_m * w_d > 0.5).astype(np.float32)
-    
-    # --- Refinement ---
-    print("[4/5] Refining Masks (Strict 3D)...")
-    refined_masks = []
-    coarse_masks_t = torch.from_numpy(coarse_masks).to(args.device).unsqueeze(0)
-    H, W = results_p1.depth.shape[1], results_p1.depth.shape[2]
-    
-    for t in tqdm(range(num_frames)):
-        pts_cam = unproject_depth(depths[:, t], intrinsics[:, t], args.device).reshape(-1, 3)
-        pose = poses[0, t]
-        pts_world = (pts_cam @ pose[:3, :3].T) + pose[:3, 3] 
+        # 4. Process Spatial Map
+        agg_score = rearrange(agg_score, 'b n s -> b s n')
+        patch_h, patch_w = H // self.patch_size, W // self.patch_size
+        saliency_map = agg_score.reshape(B_batch, S, patch_h, patch_w)
         
-        with torch.enable_grad():
-            grad_score = compute_projection_gradient_strict(
-                pts_world, depths, poses, intrinsics, coarse_masks_t, imgs_tensor,
-                H, W, args.window_size, t, num_frames
-            )
+        full_res_saliency = F.interpolate(
+            rearrange(saliency_map, 'b s h w -> (b s) 1 h w'), 
+            size=(H, W), mode='bilinear', align_corners=False
+        ).squeeze(1) # [B*S, H, W]
         
-        pts_world_np = pts_world.detach().cpu().numpy()
-        grad_map_np = normalize_map(grad_score.view(H, W).cpu().numpy())
-        coarse_mask_np = coarse_masks[t]
+        # 5. Thresholding
+        binary_mask_np = adaptive_multiotsu_threshold(full_res_saliency)
+        binary_mask = torch.from_numpy(binary_mask_np).to(q.device).bool() # [B*S, H, W]
         
-        final_mask = refine_mask_3d_official(coarse_mask_np, grad_map_np, pts_world_np, H, W)
-        refined_masks.append(final_mask)
+        # 6. Construct Attention Mask
+        # We need [B*S, 1, Nf] for Local Attention
+        mask_patches = F.interpolate(binary_mask.float().unsqueeze(1), size=(patch_h, patch_w), mode='nearest')
+        mask_patches = rearrange(mask_patches, '(b s) 1 h w -> b s (h w)', b=B_batch) # [B, S, Np]
         
-    refined_masks_np = np.stack(refined_masks).astype(np.float32)
-    
-    # --- Pass 2 ---
-    print("[5/5] Pass 2: Masked Inference...")
-    mask_tensor = torch.from_numpy(refined_masks_np).to(args.device)
-    mask_small = F.interpolate(mask_tensor.unsqueeze(1), size=(H_feat, W_feat), mode='nearest').view(num_frames, -1)
-    cls_mask = torch.zeros(num_frames, 1, device=args.device)
-    mask_tokens = torch.cat([cls_mask, mask_small], dim=1)
-    
-    for idx, block in enumerate(vit.blocks):
-        block.attn.collect_stats = False
-        if 1 <= idx <= 8:
-            block.attn.apply_masking = True
-            block.attn.dynamic_mask = mask_tokens
+        # Add Extra Token (Unmasked)
+        if start_idx > 0:
+            extra = torch.zeros((B_batch, S, start_idx), device=q.device).bool()
+            mask_flat = torch.cat([extra, mask_patches > 0.5], dim=2)
         else:
-            block.attn.apply_masking = False
+            mask_flat = (mask_patches > 0.5)
             
-    results_p2 = model.inference(pil_imgs, infer_gs=False)
-    
+        # [CRITICAL FIX]: Reshape to [B*S, 1, Total_Tokens]
+        # Attention.py expects: [Batch, 1, Seq_Len]
+        # Then it does [:, None] -> [Batch, 1, 1, Seq_Len] -> Repeat heads
+        mask_final = rearrange(mask_flat, 'b s n -> (b s) n') # [50, 1297]
+        attn_mask = mask_final.unsqueeze(1) # [50, 1, 1297]
+        
+        # Return binary_mask in [S, H, W] for refinement
+        return attn_mask, binary_mask.view(B_batch, S, H, W)[0]
+
+    @torch.no_grad()
+    def mining_stage(self, images, extrinsics, intrinsics):
+        H, W = images.shape[-2:]
+        self.motion_cues = {"qs": []}
+        self.dynamic_mask = None
+        self._clear_hooks()
+        
+        if hasattr(self.model.backbone, 'pretrained'): transformer = self.model.backbone.pretrained
+        else: transformer = self.model.backbone
+        alt_start = getattr(self.model.backbone, 'alt_start', getattr(transformer, 'alt_start', -1))
+        
+        if alt_start != -1:
+            for i, blk in enumerate(transformer.blocks):
+                if i >= alt_start and i % 2 == 1: 
+                    handle = blk.attn.register_forward_hook(self._mining_hook)
+                    self.hooks.append(handle)
+        
+        out1 = self.model(images, extrinsics, intrinsics)
+        attn_mask, binary_mask = self._compute_gram_mask(H, W)
+        self._clear_hooks()
+        return out1, attn_mask, binary_mask
+
+    @torch.no_grad()
+    def masking_stage(self, images, extrinsics, intrinsics, attn_mask):
+        self._clear_hooks()
+        self.dynamic_mask = attn_mask
+        
+        if hasattr(self.model.backbone, 'pretrained'): transformer = self.model.backbone.pretrained
+        else: transformer = self.model.backbone
+        
+        for i in range(5):
+            blk = transformer.blocks[i]
+            handle = blk.attn.register_forward_pre_hook(self._masking_hook, with_kwargs=True)
+            self.hooks.append(handle)
+            
+        out2 = self.model(images, extrinsics, intrinsics)
+        self._clear_hooks()
+        return out2
+
+# ==========================================
+# 3. Geometry Refiner (Stage 3)
+# ==========================================
+class RefineDynMask:
+    def __init__(self, depths, initial_masks, extrinsics, intrinsics, device):
+        self.depths = depths.squeeze(0) # [S, H, W]
+        self.initial_masks = initial_masks # [S, H, W]
+        
+        # Ensure extrinsics are 4x4
+        if extrinsics.shape[-2:] == (3, 4):
+            filler = torch.tensor([0,0,0,1], device=device).reshape(1,1,4).repeat(extrinsics.shape[1],1,1)
+            self.extrinsics = torch.cat([extrinsics, filler], dim=2).squeeze(0)
+        else:
+            self.extrinsics = extrinsics.squeeze(0)
+            
+        self.intrinsics = intrinsics.squeeze(0)
+        self.device = device
+        self.S, self.H, self.W = self.depths.shape
+        
+        y, x = torch.meshgrid(torch.arange(self.H, device=device), torch.arange(self.W, device=device), indexing='ij')
+        self.coords = torch.stack([x, y, torch.ones_like(x)], dim=0).reshape(3, -1).float()
+
+    def refine_masks(self, depth_thres=0.1):
+        refined_masks = self.initial_masks.clone().float()
+        
+        for t in tqdm(range(self.S), desc="Refining"):
+            try:
+                K_inv = torch.linalg.inv(self.intrinsics[t])
+                E_inv = torch.linalg.inv(self.extrinsics[t]) # Cam -> World
+            except: continue # Skip failed inversions
+            
+            d_t = self.depths[t].reshape(-1)
+            P_cam = (K_inv @ self.coords) * d_t
+            P_world = E_inv[:3, :3] @ P_cam + E_inv[:3, 3:4]
+            
+            error_acc = torch.zeros_like(d_t)
+            count = torch.zeros_like(d_t)
+            
+            for tn in [t-1, t+1]:
+                if tn < 0 or tn >= self.S: continue
+                
+                En = self.extrinsics[tn] # World -> Neighbor
+                Kn = self.intrinsics[tn]
+                Dn = self.depths[tn]
+                
+                P_cam_n = En[:3, :3] @ P_world + En[:3, 3:4]
+                z_n = P_cam_n[2, :]
+                uv_n = Kn @ P_cam_n
+                u, v = uv_n[0] / (z_n + 1e-6), uv_n[1] / (z_n + 1e-6)
+                
+                u_norm = 2 * u / (self.W - 1) - 1
+                v_norm = 2 * v / (self.H - 1) - 1
+                grid = torch.stack([u_norm, v_norm], dim=-1).view(1, 1, -1, 2)
+                
+                d_sampled = F.grid_sample(Dn.view(1, 1, self.H, self.W), grid, align_corners=True).reshape(-1)
+                
+                mask = (z_n > 0.1) & (u_norm.abs() <= 1) & (v_norm.abs() <= 1)
+                err = torch.abs(z_n - d_sampled) / (d_sampled + 1e-4)
+                
+                error_acc[mask] += err[mask]
+                count[mask] += 1
+                
+            avg_err = error_acc / (count + 1e-6)
+            geo_mask = (avg_err > depth_thres).view(self.H, self.W).float()
+            refined_masks[t] = torch.max(refined_masks[t], geo_mask)
+            
+        return refined_masks.bool().cpu().numpy()
+
+# ==========================================
+# Main
+# ==========================================
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--image-dir", type=str, required=True)
+    parser.add_argument("--output-dir", type=str, required=True)
+    parser.add_argument("--model-path", type=str, required=True)
+    parser.add_argument("--device", type=str, default="cuda")
+    args = parser.parse_args()
+
+    if not os.path.exists(args.image_dir): raise FileNotFoundError("Image dir not found")
     os.makedirs(args.output_dir, exist_ok=True)
-    for t in range(num_frames):
-        cv2.imwrite(os.path.join(args.output_dir, f"mask_{t:03d}.png"), (refined_masks_np[t]*255).astype(np.uint8))
-        d1 = normalize_map(results_p1.depth[t])
-        d2 = normalize_map(results_p2.depth[t])
-        vis = np.concatenate([d1, d2], axis=1)
-        cv2.imwrite(os.path.join(args.output_dir, f"depth_compare_{t:03d}.png"), (vis*255).astype(np.uint8))
-        
-    print(f"Done. Output: {args.output_dir}")
+    device = torch.device(args.device)
+
+    print(f"Loading model: {args.model_path}")
+    model_wrapper = DepthAnything3.from_pretrained(args.model_path).to(device)
+    vggt4d = VGGT4DPlugin(model_wrapper.model)
+
+    image_paths = sorted(glob.glob(os.path.join(args.image_dir, "*")))
+    image_paths = [p for p in image_paths if p.lower().endswith(('.png', '.jpg', '.jpeg'))]
+    if not image_paths: return
+    
+    print(f"Processing {len(image_paths)} images")
+    imgs_cpu, exts, ints = model_wrapper._preprocess_inputs(image_paths)
+    imgs_tensor, ex_t, in_t = model_wrapper._prepare_model_inputs(imgs_cpu, exts, ints)
+    ex_t_norm = model_wrapper._normalize_extrinsics(ex_t)
+
+    # Stage 1
+    print("\nStage 1: Mining Motion Cues...")
+    out1, attn_mask, init_mask = vggt4d.mining_stage(imgs_tensor, ex_t_norm, in_t)
+    if attn_mask is None:
+        print("Failed to mine cues. Exiting.")
+        return
+    pred1 = model_wrapper._convert_to_prediction(out1)
+    pred1 = model_wrapper._align_to_input_extrinsics_intrinsics(exts, ints, pred1)
+
+    # Stage 2
+    print("\nStage 2: Masked Inference...")
+    out2 = vggt4d.masking_stage(imgs_tensor, ex_t_norm, in_t, attn_mask)
+    pred2 = model_wrapper._convert_to_prediction(out2)
+    pred2 = model_wrapper._align_to_input_extrinsics_intrinsics(exts, ints, pred2)
+
+    # Stage 3
+    print("\nStage 3: Refinement...")
+    try:
+        refiner = RefineDynMask(
+            torch.from_numpy(pred1.depth).unsqueeze(0).to(device),
+            init_mask,
+            torch.from_numpy(pred2.extrinsics).unsqueeze(0).float().to(device),
+            torch.from_numpy(pred2.intrinsics).unsqueeze(0).float().to(device),
+            device
+        )
+        final_masks = refiner.refine_masks()
+    except Exception as e:
+        print(f"Refinement error: {e}")
+        final_masks = init_mask.cpu().numpy()
+
+    # Save
+    print(f"Saving to {args.output_dir}")
+    save_results(args.output_dir, image_paths, pred1.depth, pred1.conf, pred2, final_masks)
+    print("Done!")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--image-dir", required=True)
-    parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--model-name", default="da3nested-giant-large")
-    parser.add_argument("--model-path", default="", help="Local model path")
-    parser.add_argument("--window-size", type=int, default=2)
-    parser.add_argument("--device", default="cuda")
-    args = parser.parse_args()
-    main(args)
+    main()

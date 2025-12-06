@@ -44,7 +44,8 @@ class Attention(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
         self.rope = rope
 
-    def forward(self, x: Tensor, pos=None, attn_mask=None) -> Tensor:
+    # VGGT4D 需要计算 Gram 矩阵 $QQ^T$ 和 $KK^T$
+    def forward(self, x: Tensor, pos=None, attn_mask=None, return_qkv=False): # 去掉 -> Tensor 类型提示
         B, N, C = x.shape
         qkv = (
             self.qkv(x)
@@ -53,10 +54,19 @@ class Attention(nn.Module):
         )
         q, k, v = qkv[0], qkv[1], qkv[2]
         q, k = self.q_norm(q), self.k_norm(k)
+        
+        # 1. 先备份 Q 和 K (因为后面可能还会被 ROPE 修改，或者直接返回)
+        # 这里的 q, k 是还没进 Attention 计算的原始特征，正是 VGGT4D 需要的
+        q_out, k_out = q, k 
+
         if self.rope is not None and pos is not None:
             q = self.rope(q, pos)
             k = self.rope(k, pos)
-            
+            # 如果你需要带位置编码的 Q/K 来算 Gram 矩阵，可以在这里更新 out
+            q_out, k_out = q, k
+
+        # 2. 必须继续执行 Attention 计算，算出 x
+        # 否则网络这一层就断了，无法传递给下一层
         if self.fused_attn:
             x = F.scaled_dot_product_attention(
                 q,
@@ -79,6 +89,11 @@ class Attention(nn.Module):
         x = x.transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
+        
+        # 3. 在最后统一返回
+        if return_qkv:
+            return x, q_out, k_out  # 返回 3 个值，与 Block.py 对齐
+        
         return x
 
     def _forward(self, x: Tensor) -> Tensor:
