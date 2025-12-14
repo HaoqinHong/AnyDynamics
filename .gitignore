@@ -41,3 +41,5 @@ temp*.png
 
 medical_test/dataset/da3_depth_100.npz
 medical_test/tsdf_mesh_cpu_auto_v1.ply
+
+/submodules
