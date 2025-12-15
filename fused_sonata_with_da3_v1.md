@@ -60,7 +60,8 @@ demo/2_sem_seg.py: 语义分割 (Semantic Segmentation - Linear Probing)
 run_sonata_with_DA3.py
 ```
 
-### sonata 区分动静态粒子并分别编码
+### 区分动静态粒子并分别编码
+#### 1. 体素计数方法（失败）
 利用 Sonata (Pointcept) 框架中的 GridSample (网格采样) 机制和 PTv3 的高效长序列处理能力。
 
 对于静态背景（大部分粒子）：当您将多帧点云通过相机外参（Extrinsics）对齐到同一个世界坐标系后，静态物体（如墙壁、桌子）在不同帧中的点会落在空间中的几乎同一个位置。Sonata 的 GridSample 功能 会将空间划分为细小的体素（Voxel，例如 2cm）。落入同一个体素内的多个点（来自不同帧）会被合并（通常保留一个或做平均）。效果：这实际上起到了**多帧去噪（Denoising）和点云致密化（Densification）**的作用。多帧的观测让静态背景的几何结构更清晰、更完整。
@@ -76,3 +77,53 @@ run_sonata_with_DA3.py
 ```
 python run_sonata_fused_separation.py
 ```
+
+#### 2. 基于重投影一致性的动静分离（失败，应该采用 metric depth）
+我们不再等到生成 3D 点云后再去分，而是在 2D 像素阶段 就通过多帧比对把动态物体“扣”出来。
+核心逻辑：对于第 $i$ 帧的某个像素，如果它是静止的墙壁，那么根据相机位姿把它投影到第 $j$ 帧，其深度应该和第 $j$ 帧预测的深度严丝合缝。如果误差很大，说明它是动的（或者是被遮挡的）。
+
+- 引入 CONF_THRESH：利用 DA3 的置信度图，直接剔除那些不可信的预测（通常是也是噪声源），提高点云质量。
+- 重投影一致性 (Geometric Consistency)：这是利用深度和位姿先验的核心。只要一个点在相邻帧（CHECK_STRIDE=3）能找到对应的位置且深度一致，它就是静态背景。找不到对应（误差大）的点，就是动态物体（或新出现的区域）。
+```
+python run_sonata_reprojection.py
+```
+
+#### 3. 特征流一致性 (Feature-Metric Consistency)
+出发点：Sonata 绝对可以做匹配，但是 完全匹配上就当作静态 这个逻辑需要加一个空间约束才成立。
+正确的利用方式：特征流一致性 (Feature-Metric Consistency)，要实现 “匹配即静态”，您需要同时检查特征和位置。
+我们可以设计这样一个更高级的判别器：$$IsStatic = (FeatureMatch > \text{Thresh}_1) \quad \mathbf{AND} \quad (WorldDist < \text{Thresh}_2)$$
+步骤 1：找匹配利用 Sonata 提取第 $i$ 帧和第 $j$ 帧的特征，计算相似度矩阵，找到最佳匹配点对 $(P_i, P_j)$。这一步利用了 Sonata 强大的抗噪和语义理解能力，比光流法（Optical Flow）更稳，不会因为光照变化跟丢。
+步骤 2：测距离将匹配点对 $(P_i, P_j)$ 都转到世界坐标系（利用 DA3 的 Pose）。如果 $||P_i^{world} - P_j^{world}|| \approx 0$：是静态背景（特征匹配，且位置没动）。如果 $||P_i^{world} - P_j^{world}|| \gg 0$：是动态物体（特征匹配，但位置变了）。如果找不到匹配：是噪声或遮挡。
+
+利用 Sonata 的 特征相似度（Feature Similarity） 结合 几何距离（Geometric Distance），我们可以构建一个更加鲁棒的动静判别器。
+这种方法的核心优势在于：它能识别出“移动的物体”。传统的距离法只能告诉你“这里变了”，但不知道是物体走了，还是新物体来了。特征法可以告诉你：“这只熊（特征A） 从 A点 移动到了 B点。”
+
+对于每一帧 $t$ 的每一个点 $P_i$：在相邻帧 $t+k$ 中搜索与其 Sonata 特征最相似 的点 $P_{match}$。
+静态判定：如果特征相似度很高（$>0.8$），且空间距离很近（$<0.1m$） $\rightarrow$ 背景。
+动态判定：如果特征相似度很高（$>0.8$），但空间距离很远（$>0.1m$） $\rightarrow$ 移动物体。
+噪声判定：如果找不到相似特征 $\rightarrow$ 遮挡或噪声。
+
+**体素化后 Token 数量锐减**，罪魁祸首：DA3 的相对深度 (Relative Depth)。Depth Anything 3 (尤其是 GIANT 版本) 输出的深度通常是归一化的或者相对的。它输出的数值范围可能在 0.0 ~ 1.0 之间。如果不乘以 SCALE_FACTOR，或者乘得不够大，整个 3D 场景就会被压缩在一个极小的盒子里（例如 $1 \times 1 \times 1$）。所以采用 depth-anything/DA3NESTED-GIANT-LARGE，直接信任模型输出的 Metric Depth。
+
+```
+python run_sonata_feature_matching.py
+```
+
+#### 4. 利用 Inverse Mapping 实现无损还原
+Sonata (PointTransformerV3) 的核心优势之一就是它在进行 GridSample（体素化）时，会生成一个 inverse 索引。这个索引是连接“微观像素”和“宏观体素”的高速公路，我们完全不需要 KNN，就能把体素的判断结果原封不动地“广播”回原始点云。
+
+- DA3 生成 (Dense)：利用 DA3 预测出高精度的密集点云 $P_{dense}$ (例如 100万点)。
+- Sonata 特征化 (Sparse)：将 $P_{dense}$ 放入 GridSample。得到 $P_{token}$ (例如 1万个 Token) 用于计算。关键点：同时得到一个 $I_{map}$ (Inverse Index)，它记录了“第 $i$ 个原始点属于第 $j$ 个 Token”。
+- 时序匹配 (On Tokens)：在 Token 层面计算特征相似度，判断哪些 Token 是静态的，哪些是动态的。得到 $Mask_{token}$。
+- 无损还原 (Broadcast)：利用 $I_{map}$ 直接查表：$Mask_{dense} = Mask_{token}[I_{map}]$。这就相当于：如果“体素A”是静态的，那么“体素A”里包含的 50 个原始点全都是静态的。
+
+```
+python run_sonata_inverse_projection.py
+```
+
+### 基于网格的稀疏序列化
+
+要把 DA3 重建的点云通过 Sonata 编码为 Token，并融入 Transformer 来解码出 Free-time 3DGS（任意时刻的动态 3D 高斯），同时最大化动静分离效果，真正应该利用的是 Sonata 的 “基于网格的稀疏序列化（Grid-based Sparse Serialization）” 能力，并结合 “双流 Token 化（Dual-Stream Tokenization）” 策略。
+
+- 不要试图让一个 Sonata 模型同时处理混乱的动静混合点云。
+- 要利用 DA3 提供的多帧几何一致性，先在物理层面把点云拆开，然后分别用 Sonata 编码成 Token，最后在 Transformer 里做时空融合。这是通往高质量 Free-time 3DGS 的捷径。
