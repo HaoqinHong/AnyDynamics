@@ -111,7 +111,7 @@ def main():
     
     print("Loading model from pretrained...")
     # 请确保这里的路径是正确的，可以是本地路径或 HuggingFace ID
-    model = DepthAnything3.from_pretrained("/backup/group_朱聪聪/hqhong/models/DA3-GIANT", dynamic=True)
+    model = DepthAnything3.from_pretrained("/opt/data/private/models/depthanything3/DA3-GIANT", dynamic=True)
     model = model.to(device)
     model.eval()
     print(f"Model loaded on {device}")
