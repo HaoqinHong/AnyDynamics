@@ -42,7 +42,7 @@ Step 2 (Sonata 编码):
 python run_preprocess_4d_tokens_v1.py
 ```
 
-核心逻辑是：利用 Depth Anything 3 (DA3) 提供的强几何先验，将视频中的每一帧提升为 3D 点云，然后通过 Sonata 将这些庞大的点云在时空上压缩成紧凑的“体素 Token”，并保留时间及视角信息。
+核心逻辑是：利用 Depth Anything 3 (DA3) 提供的强几何先验，将视频中的每一帧提升为 3D 点云，然后通过 Sonata 将这些庞大的点云在时空上压缩成紧凑的 体素 Token，并保留时间及视角信息。
 
 在 sonata/model.py 中，PointTransformerV3 的 __init__ 定义了 enc_depths 和 stride：stride=(2, 2, 2, 2)：共 4 个下采样阶段，每次网格步长扩大 2 倍。总步长扩大了 $2^4 = 16$ 倍。但由于是稀疏点云，GridPooling 会合并同一个大格子里的所有点。对于拥挤的场景，点数的减少往往远超 16 倍，可能达到 100 倍甚至更多（取决于场景的空间分布）。
 
