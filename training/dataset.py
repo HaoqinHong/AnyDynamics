@@ -51,31 +51,29 @@ class IntegratedVideoDataset(Dataset):
                     self.image_paths, infer_gs=True, process_res=518, export_format="mini_npz"
                 )
             
-            # 反投影生成大点云
+            # 1. 获取原始数据
             depths = torch.from_numpy(prediction.depth).to(self.device)
             intrinsics = torch.from_numpy(prediction.intrinsics).to(self.device)
-            
-            # === 修复开始: 处理 3x4 矩阵问题 ===
             extrinsics_np = prediction.extrinsics
-            # 如果是 3x4，给它补成 4x4
+            
+            # 补齐 3x4 -> 4x4
             if extrinsics_np.ndim == 3 and extrinsics_np.shape[1] == 3 and extrinsics_np.shape[2] == 4:
                 N = extrinsics_np.shape[0]
-                # 创建底部的 [0,0,0,1]
                 bottom_row = np.array([[[0, 0, 0, 1]]], dtype=extrinsics_np.dtype).repeat(N, axis=0)
                 extrinsics_np = np.concatenate([extrinsics_np, bottom_row], axis=1)
             
-            extrinsics = torch.from_numpy(extrinsics_np).to(self.device).float() # 现在是 [N, 4, 4]
-            # === 修复结束 ===
-            
+            w2c_raw = torch.from_numpy(extrinsics_np).to(self.device).float()
+            c2w_raw = torch.linalg.inv(w2c_raw)
+
+            # 2. 生成原始世界坐标点云
             all_pts = []
             all_colors = []
             
-            print("   Accumulating points...")
+            print("   Accumulating points & Calculating Center...")
             for i in range(self.num_frames):
                 d = depths[i]
                 K = intrinsics[i]
-                w2c = extrinsics[i] # 现在是 [4, 4]
-                c2w = torch.linalg.inv(w2c) # 现在可以成功求逆了！
+                c2w = c2w_raw[i] # 原始相机位姿
                 
                 img_raw = cv2.imread(self.image_paths[i])
                 img_raw = cv2.cvtColor(img_raw, cv2.COLOR_BGR2RGB)
@@ -83,38 +81,52 @@ class IntegratedVideoDataset(Dataset):
                 
                 H, W = d.shape
                 y, x = torch.meshgrid(torch.arange(H), torch.arange(W), indexing='ij')
-                x = x.to(self.device).flatten()
-                y = y.to(self.device).flatten()
-                z = d.flatten()
+                x, y, z = x.to(self.device).flatten(), y.to(self.device).flatten(), d.flatten()
                 
                 valid = (z > 0)
+                # 降采样
                 if valid.sum() > 40000:
                     indices = torch.nonzero(valid).squeeze()
-                    perm = torch.randperm(len(indices))[:40000]
-                    idx = indices[perm]
+                    idx = indices[torch.randperm(len(indices))[:40000]]
                 else:
                     idx = torch.nonzero(valid).squeeze()
                 
                 if idx.numel() == 0: continue
 
+                # Back-project
                 x_s, y_s, z_s = x[idx], y[idx], z[idx]
                 fx, fy, cx, cy = K[0,0], K[1,1], K[0,2], K[1,2]
-                
                 X_c = (x_s - cx) * z_s / fx
                 Y_c = (y_s - cy) * z_s / fy
                 Z_c = z_s
                 pts_c = torch.stack([X_c, Y_c, Z_c], dim=-1)
-                # 应用位姿: pts_w = R * pts_c + T
-                # 使用 4x4 矩阵的前 3x3 和 3x1
                 pts_w = (c2w[:3,:3] @ pts_c.T).T + c2w[:3,3]
                 
                 all_pts.append(pts_w)
                 all_colors.append(img_tensor.flatten(0,1)[idx])
                 
-            self.big_coords = torch.cat(all_pts, dim=0)
+            raw_coords = torch.cat(all_pts, dim=0)
             self.big_colors = torch.cat(all_colors, dim=0)
             
-            self.extrinsics = extrinsics.cpu()
+            # =========================================================
+            # 3. 核心修复：坐标系对齐 (Center Shift)
+            # =========================================================
+            # 计算整个场景的中心
+            scene_center = raw_coords.mean(dim=0) # [3]
+            print(f"   [Coordinate Fix] Shifting scene center from {scene_center.cpu().numpy()} to (0,0,0)")
+            
+            # A. 移动点云
+            self.big_coords = raw_coords - scene_center
+            
+            # B. 移动相机 (修改 c2w 的平移部分)
+            # c2w 矩阵的前3行第4列是平移向量 T
+            c2w_fixed = c2w_raw.clone()
+            c2w_fixed[:, :3, 3] -= scene_center
+            
+            # 重新计算 w2c (extrinsics)
+            w2c_fixed = torch.linalg.inv(c2w_fixed)
+            
+            self.extrinsics = w2c_fixed.cpu() # 保存修正后的相机
             self.intrinsics = intrinsics.cpu()
 
             del da3_model
@@ -127,12 +139,12 @@ class IntegratedVideoDataset(Dataset):
         concerto_model.eval()
 
         transform = Compose([
-            dict(type="CenterShift", apply_z=True),
-            dict(type="GridSample", grid_size=voxel_size, hash_type="fnv", mode="train",
-                 return_grid_coord=True, return_inverse=True),
-            dict(type="ToTensor"),
-            dict(type="Collect", keys=("coord", "grid_coord", "inverse"), feat_keys=("coord", "color"))
-        ])
+                    # dict(type="CenterShift", apply_z=True),  <-- 注释掉这一行！我们已经手动对齐了
+                    dict(type="GridSample", grid_size=voxel_size, hash_type="fnv", mode="train",
+                        return_grid_coord=True, return_inverse=True),
+                    dict(type="ToTensor"),
+                    dict(type="Collect", keys=("coord", "grid_coord", "inverse"), feat_keys=("coord", "color"))
+                ])
 
         input_dict = {"coord": self.big_coords.cpu().numpy(), "color": self.big_colors.cpu().numpy()}
         input_dict = transform(input_dict)
