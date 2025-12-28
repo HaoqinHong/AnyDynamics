@@ -38,7 +38,7 @@ class FreeTimeGSModel(nn.Module):
         nn.init.zeros_(self.dynamic_head.bias)
 
     def forward(self, concerto_tokens, concerto_coords, t):
-        x = self.feat_proj(concerto_tokens) # [B, N, H]
+        x = self.feat_proj(concerto_tokens) 
         
         # Base
         base_params = self.base_head(x)
@@ -47,10 +47,7 @@ class FreeTimeGSModel(nn.Module):
         base_rot = F.normalize(base_params[..., 6:10], dim=-1)
         base_opac = base_params[..., 10]
         
-        # 原来是: base_sh = base_params[..., 11:]  <-- 导致维度不足 (3维)
-        # 或者是: base_sh = base_params[..., 11:].unsqueeze(-2) <-- 导致 gsplat 报错 (3在倒数第二位)
-        
-        # 正确做法: 在最后增加一维，变成 [B, N, 3, 1]
+        # SH [B, N, 3, 1] for gsplat
         base_sh = base_params[..., 11:].unsqueeze(-1)
         
         # Dynamic
@@ -59,10 +56,22 @@ class FreeTimeGSModel(nn.Module):
         x_dyn = self.transformer(x_dyn)
         deltas = self.dynamic_head(x_dyn)
         
-        # Fusion
+        # === Fusion & Aggressive Initialization ===
+        
+        # 1. Position: Allow large movement
         final_xyz = base_xyz + deltas[..., :3]
-        final_scale = torch.exp(base_scale + deltas[..., 3:6])
+        
+        # 2. Scale: Bias +2.0 -> sigmoid(2.0) ~= 0.88
+        # Result ~ 0.005 + 0.3 * 0.88 ~= 0.26 (Big enough to see!)
+        raw_scale = base_scale + deltas[..., 3:6] + 2.0 
+        scale_min, scale_max = 0.005, 0.3
+        final_scale = scale_min + (scale_max - scale_min) * torch.sigmoid(raw_scale)
+        
+        # 3. Rotation
         final_rot = F.normalize(base_rot + deltas[..., 6:10], dim=-1)
-        final_opac = torch.sigmoid(base_opac + deltas[..., 10])
+        
+        # 4. Opacity: Bias +3.0 -> sigmoid(3.0) ~= 0.95 (Solid!)
+        raw_opac = base_opac + deltas[..., 10] + 3.0
+        final_opac = torch.sigmoid(raw_opac)
         
         return Gaussians(final_xyz, final_scale, final_rot, final_opac, base_sh)
